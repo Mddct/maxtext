@@ -25,6 +25,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import shard_map
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
+from kernels.ragged_attention import mqa_reference, ragged_mqa
 import jax.numpy as jnp
 
 import common_types
@@ -119,6 +120,8 @@ class AttentionOp(nn.Module):
   flash_axis_names: AxisNames = (BATCH, HEAD, LENGTH, D_KV)
   cache_logical_axis_names: AxisNames = (CACHE_BATCH, CACHE_SEQUENCE, CACHE_HEADS, CACHE_KV)
   cache_scale_logical_axis_names: AxisNames = (CACHE_SCALE_BATCH, CACHE_SCALE_SEQUENCE, CACHE_SCALE_HEADS, CACHE_SCALE_KV)
+  ragged_qkv_axis_names: AxisNames = (CACHE_BATCH, CACHE_HEADS, CACHE_SEQUENCE, CACHE_KV)
+  ragged_lengths_names: AxisNames = (CACHE_BATCH,)
   prefill_cache_axis_order: AxisIdxes = (1, 2, 0, 3)
   ar_cache_axis_order: AxisIdxes = (1, 2, 0, 3)
   compute_axis_order: AxisIdxes = (0, 1, 2, 3)
@@ -169,10 +172,14 @@ class AttentionOp(nn.Module):
 
     return jnp.where(output_mask, 0.0, DEFAULT_MASK_VALUE) if output_mask is not None else None
 
-  def apply_attention(self, query: Array, key: Array| KVTensor, value: Array| KVTensor, decoder_segment_ids: Array | None, model_mode: str):
+  def apply_attention(self, query: Array, key: Array| KVTensor, value: Array| KVTensor, decoder_segment_ids: Array | None, lengths: Array | None, model_mode: str, use_ragged: bool = False):
     self.check_attention_inputs(query, key, value)
     length = query.shape[-3]
-    if (
+    if use_ragged and model_mode == common_types.MODEL_MODE_AUTOREGRESSIVE:
+      if lengths is None:
+        lengths = jnp.sum(decoder_segment_ids, axis=-1)
+      return self.ragged_attention(query, key, value, lengths)
+    elif (
         self.attention_kernel == "dot_product"
         or (self.attention_kernel == "autoselected" and model_mode == common_types.MODEL_MODE_AUTOREGRESSIVE)
         or (self.attention_kernel == "autoselected" and length < 128)
@@ -203,6 +210,50 @@ class AttentionOp(nn.Module):
       return self.cudnn_flash_attention(query, key, value, decoder_segment_ids, model_mode), None, None
     else:
       raise ValueError(f"Unexpected attention kernel {self.attention_kernel=}.")
+  
+  def ragged_attention(self, query: Array, key: Array, value: Array, lengths: Array) -> tuple[Array, Array, Array]:
+    """Ragged Attention."""
+    # jax.debug.print("lengths: {}", lengths)
+    ragged_qkv = nn.logical_to_mesh_axes(self.ragged_qkv_axis_names)
+    ragged_lengths = nn.logical_to_mesh_axes(self.ragged_lengths_names)
+    ragged_output = nn.logical_to_mesh_axes(self.cache_logical_axis_names)
+    @functools.partial(
+        shard_map,
+        mesh=self.mesh,
+        in_specs=(
+            ragged_qkv,
+            ragged_qkv,
+            ragged_qkv,
+            ragged_lengths,
+        ),
+        out_specs=ragged_output,
+        check_rep=False,
+    )
+    def wrap_ragged_attention(query, key, value, lengths):
+      vmap_ragged_mqa = jax.vmap(ragged_mqa, in_axes=[1, 1, 1, None], out_axes=2)
+      o, m, l  = vmap_ragged_mqa(query, key, value, lengths)
+      # ragged_attention - before o.shape=(64, 1, 8, 128)
+      # ragged_attention - before m.shape=(64, 1, 8)
+      # ragged_attention - before l.shape=(64, 1, 8)
+      m = jnp.expand_dims(m, axis=-1)
+      l = jnp.expand_dims(l, axis=-1)
+      o = o * l 
+      # ragged_attention - after o.shape=(64, 1, 8, 128)
+      # ragged_attention - after m.shape=(64, 1, 8, 1)
+      # ragged_attention - after l.shape=(64, 1, 8, 1)
+      return o, m, l
+
+    # ragged_attention - before query.shape=(64, 1, 32, 128)
+    # ragged_attention - before key.shape=(64, 1024, 32, 128)
+    # ragged_attention - before value.shape=(64, 1024, 32, 128)
+    # ragged_attention - lengths.shape=(64,)
+    query = jnp.swapaxes(query, 1, 2)
+    key = jnp.swapaxes(key, 1, 2)
+    value = jnp.swapaxes(value, 1, 2)
+    # ragged_attention - after query.shape=(64, 32, 1, 128)
+    # ragged_attention - after key.shape=(64, 32, 1024, 128)
+    # ragged_attention - after value.shape=(64, 32, 1024, 128)
+    return wrap_ragged_attention(query, key, value, lengths)
 
   def tpu_flash_attention(self, query: Array, key: Array, value: Array, decoder_segment_ids: Array | None) -> Array:
     """TPU Flash Attention."""
@@ -550,6 +601,14 @@ class AttentionOp(nn.Module):
         jnp.int32,
     )
 
+    cached_lengths_var = self.variable(
+        "cache",
+        "cached_ar_lengths",
+        nn.with_logical_partitioning(jnp.zeros, (CACHE_BATCH, )),
+        (cache_logical_shape[0], ),
+        jnp.int32,
+    )
+
     if self.kv_quant:
       cache_scale_logical_shape = self._get_cache_scale_logical_shape(batch, heads)
       cache_scale_axis_names = self.transpose_tuple(self.cache_scale_logical_axis_names, self.ar_cache_axis_order)
@@ -577,7 +636,7 @@ class AttentionOp(nn.Module):
       "cache", "cache_ar_index", nn.with_logical_partitioning(jnp.zeros, ()), (1,), jnp.int32)
     key_vars = (cached_key_var, cached_key_scale_var)
     value_vars = (cached_value_var, cached_value_scale_var)
-    return key_vars, value_vars, cached_segment_id_var, cache_index_var
+    return key_vars, value_vars, cached_segment_id_var, cache_index_var, cached_lengths_var
 
   def kv_cache_prefill(
       self,
@@ -631,6 +690,8 @@ class AttentionOp(nn.Module):
       cached_key_vars: tuple[nn.Variable, nn.Variable | None],
       cached_value_vars: tuple[nn.Variable, nn.Variable | None],
       one_hot_indices: Array,
+      lengths: Array,
+      use_ragged: bool,
   ) -> None:
     """Adds a single token's results to the ar kv cache
 
@@ -660,16 +721,24 @@ class AttentionOp(nn.Module):
       one_token_value_shaped_for_cache, one_token_value_scale_shaped_for_cache = self.kv_quant.quantize(
         one_token_value_shaped_for_cache, ar_cache_axis_names)
 
-    one_hot_indices = one_hot_indices.astype(int)
-    ar_cache_update_idx = jnp.squeeze(one_hot_indices)
 
+    ar_cache_update_idx = jnp.squeeze(one_hot_indices)
     ar_cache_update_axis = ar_cache_axis_names.index(CACHE_SEQUENCE)
-    cached_key_var.value = jax.lax.dynamic_update_index_in_dim(
-      cached_key_var.value, one_token_key_shaped_for_cache, ar_cache_update_idx, ar_cache_update_axis)
+    if use_ragged:
+      dynamic_update = jax.vmap(jax.lax.dynamic_update_slice, in_axes=(0, 0, (None, 0, None)))
+      cached_key_var.value = dynamic_update(cached_key_var.value, one_token_key_shaped_for_cache, (0, lengths, 0))
+      cached_value_var.value = dynamic_update(cached_value_var.value, one_token_value_shaped_for_cache, (0, lengths, 0))
+
+    else: 
+      one_hot_indices = one_hot_indices.astype(int)
+      cached_key_var.value = jax.lax.dynamic_update_index_in_dim(
+        cached_key_var.value, one_token_key_shaped_for_cache, ar_cache_update_idx, ar_cache_update_axis)
+      cached_value_var.value = jax.lax.dynamic_update_index_in_dim(
+        cached_value_var.value, one_token_value_shaped_for_cache, ar_cache_update_idx, ar_cache_update_axis)
+
     cached_key_var.value = nn.with_logical_constraint(cached_key_var.value, ar_cache_axis_names)
-    cached_value_var.value = jax.lax.dynamic_update_index_in_dim(
-      cached_value_var.value, one_token_value_shaped_for_cache, ar_cache_update_idx, ar_cache_update_axis)
     cached_value_var.value = nn.with_logical_constraint(cached_value_var.value, ar_cache_axis_names)
+    
 
     if self.kv_quant:
       ar_cache_scale_axis_names = self.transpose_tuple(self.cache_scale_logical_axis_names, self.ar_cache_axis_order)
@@ -705,6 +774,7 @@ class AttentionOp(nn.Module):
       self,
       key: Array,
       value: Array,
+      use_ragged: bool,
   ):
     """In autoregressive mode, we update the cache for this entry and
        then return the full cache.
@@ -726,14 +796,15 @@ class AttentionOp(nn.Module):
     if not is_initialized:
       raise ValueError("Error, we can't do autoregression if we haven't seeded the KV Cache.")
 
-    cached_ar_key_vars, cached_ar_value_vars, cached_ar_segment_id_var, cache_ar_index_var = self._get_ar_cache_vars(batch, heads, kv_head_size)
+    cached_ar_key_vars, cached_ar_value_vars, cached_ar_segment_id_var, cache_ar_index_var, cache_ar_lengths_var = self._get_ar_cache_vars(batch, heads, kv_head_size)
 
-    self.update_ar_key_value(key, value, cached_ar_key_vars, cached_ar_value_vars, cache_ar_index_var.value)
+    self.update_ar_key_value(key, value, cached_ar_key_vars, cached_ar_value_vars, cache_ar_index_var.value, cache_ar_lengths_var.value, use_ragged)
     active_indicator = jnp.zeros((batch, 1), dtype=jnp.int32) + common_types.DECODING_ACTIVE_SEQUENCE_INDICATOR
     cached_ar_segment_id_var.value = jax.lax.dynamic_update_index_in_dim(
         cached_ar_segment_id_var.value, active_indicator, jnp.squeeze(cache_ar_index_var.value), 1
     )
     cache_ar_index_var.value = jnp.mod(cache_ar_index_var.value + 1, self.max_target_length - self.max_prefill_predict_length)
+    cache_ar_lengths_var.value = cache_ar_lengths_var.value.at[:].add(1)
 
     # The below retrieves the existing prefill cache variables, not creating new ones
     cached_prefill_key_vars, cached_prefill_value_vars, cached_prefill_segment_id_var = self._get_prefill_cache_vars(batch, heads, kv_head_size)
@@ -748,10 +819,11 @@ class AttentionOp(nn.Module):
         self.get_cached_values(cached_ar_key_vars, key.dtype, self.ar_cache_axis_order),
         self.get_cached_values(cached_ar_value_vars, value.dtype, self.ar_cache_axis_order),
         cached_ar_segment_id_var.value,
+        cache_ar_lengths_var.value
     )
     return cached_prefill, cached_ar
 
-  def kv_cache(self, key: Array, value: Array, decoder_segment_ids: Array, model_mode: str) -> tuple:
+  def kv_cache(self, key: Array, value: Array, decoder_segment_ids: Array, model_mode: str, use_ragged: bool) -> tuple:
     """KV cache takes the current state and updates the state accordingly.
 
     The key and value have dimension [b, s, n_kv, d],
@@ -777,7 +849,7 @@ class AttentionOp(nn.Module):
     elif model_mode == common_types.MODEL_MODE_PREFILL:
       return self.kv_cache_prefill(key, value, decoder_segment_ids), None
     elif model_mode == common_types.MODEL_MODE_AUTOREGRESSIVE:
-      return self.kv_cache_autoregressive(key, value)
+      return self.kv_cache_autoregressive(key, value, use_ragged)
     else:
       raise ValueError(f"Model Mode isn't supported! {model_mode=}")
 
@@ -806,14 +878,17 @@ class AttentionOp(nn.Module):
 
   @nn.compact
   def __call__(self, query, key, value, decoder_segment_ids, model_mode):
-    prefill_kv_cache, ar_kv_cache = self.kv_cache(key, value, decoder_segment_ids, model_mode)
+    use_ragged = True
+    prefill_kv_cache, ar_kv_cache = self.kv_cache(key, value, decoder_segment_ids, model_mode, use_ragged=use_ragged)
 
     prefill_unnormalized_output, prefill_exponentials_max, prefill_exponentials_sum = self.apply_attention(
         query=query,
         key=prefill_kv_cache[0],
         value=prefill_kv_cache[1],
         decoder_segment_ids=prefill_kv_cache[2],
+        lengths=None,
         model_mode=model_mode,
+        use_ragged=use_ragged,
     )
 
     # Return the "prefill" cache if it actually the combined prefill+ar kv cache
@@ -827,13 +902,18 @@ class AttentionOp(nn.Module):
         key=ar_kv_cache[0],
         value=ar_kv_cache[1],
         decoder_segment_ids=ar_kv_cache[2],
+        lengths=ar_kv_cache[3],
         model_mode=model_mode,
+        use_ragged=use_ragged,
     )
 
-    unnormalized_outputs = [prefill_unnormalized_output, ar_unnormalized_output]
-    exponentials_maxes = [prefill_exponentials_max, ar_exponentials_max]
-    exponentials_sums = [prefill_exponentials_sum, ar_exponentials_sum]
-    return self.normalize_attention(unnormalized_outputs, exponentials_maxes, exponentials_sums)
+    if ar_unnormalized_output is not None:
+      unnormalized_outputs = [prefill_unnormalized_output, ar_unnormalized_output]
+      exponentials_maxes = [prefill_exponentials_max, ar_exponentials_max]
+      exponentials_sums = [prefill_exponentials_sum, ar_exponentials_sum]
+      return self.normalize_attention(unnormalized_outputs, exponentials_maxes, exponentials_sums)
+    else:
+      return prefill_unnormalized_output / prefill_exponentials_sum
 
 
 class Attention(nn.Module):

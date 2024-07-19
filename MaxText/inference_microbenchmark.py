@@ -252,47 +252,47 @@ def main(config, inference_metadata: Optional[Dict[str, Any]] = None):
   num_model_params, model_size, _ = max_utils.summarize_pytree_data(params, name="Model")
 
   benchmark_results = {}
-  if "prefill" in stages_to_benchmark:
+  # if "prefill" in stages_to_benchmark:
 
-    benchmark_results["prefill-result-sizes"] = {}
-    benchmark_results["prefill"] = {}
-    benchmark_results["insert"] = {}
-    prefill_tokens = {}
-    prefill_true_lengths = {}
+  #   benchmark_results["prefill-result-sizes"] = {}
+  #   benchmark_results["prefill"] = {}
+  #   benchmark_results["insert"] = {}
+  #   prefill_tokens = {}
+  #   prefill_true_lengths = {}
 
-    for prefill_length in prefill_lengths:
-      prefill_tokens[prefill_length], prefill_true_lengths[prefill_length] = token_utils.tokenize_and_pad(
-        text, vocab, is_bos=True, prefill_lengths=[prefill_length]
-      )
-      benchmark_results["prefill-result-sizes"][prefill_length] = summarize_prefill_result(
-        engine, params, prefill_tokens[prefill_length], prefill_true_lengths[prefill_length]
-      )
+  #   for prefill_length in prefill_lengths:
+  #     prefill_tokens[prefill_length], prefill_true_lengths[prefill_length] = token_utils.tokenize_and_pad(
+  #       text, vocab, is_bos=True, prefill_lengths=[prefill_length]
+  #     )
+  #     benchmark_results["prefill-result-sizes"][prefill_length] = summarize_prefill_result(
+  #       engine, params, prefill_tokens[prefill_length], prefill_true_lengths[prefill_length]
+  #     )
 
-    for prefill_length in prefill_lengths:
-      benchmark_results["prefill"][prefill_length] = prefill_benchmark(
-        config,
-        engine,
-        params,
-        prefill_tokens[prefill_length],
-        prefill_true_lengths[prefill_length],
-        num_model_params,
-        benchmark_loop_iters
-      )
+  #   for prefill_length in prefill_lengths:
+  #     benchmark_results["prefill"][prefill_length] = prefill_benchmark(
+  #       config,
+  #       engine,
+  #       params,
+  #       prefill_tokens[prefill_length],
+  #       prefill_true_lengths[prefill_length],
+  #       num_model_params,
+  #       benchmark_loop_iters
+  #     )
 
-      prefill_insert_time, decode_state = prefill_insert_benchmark(
-        config,
-        engine,
-        decode_state,
-        params,
-        engine.max_concurrent_decodes,
-        prefill_tokens[prefill_length],
-        prefill_true_lengths[prefill_length],
-        benchmark_loop_iters
-      )
-      benchmark_results["insert"][prefill_length] = {}
-      benchmark_results["insert"][prefill_length]["time_in_ms"] = (
-        prefill_insert_time["time_in_ms"] - benchmark_results["prefill"][prefill_length]["time_in_ms"]
-      )
+  #     prefill_insert_time, decode_state = prefill_insert_benchmark(
+  #       config,
+  #       engine,
+  #       decode_state,
+  #       params,
+  #       engine.max_concurrent_decodes,
+  #       prefill_tokens[prefill_length],
+  #       prefill_true_lengths[prefill_length],
+  #       benchmark_loop_iters
+  #     )
+  #     benchmark_results["insert"][prefill_length] = {}
+  #     benchmark_results["insert"][prefill_length]["time_in_ms"] = (
+  #       prefill_insert_time["time_in_ms"] - benchmark_results["prefill"][prefill_length]["time_in_ms"]
+  #     )
 
   if "generate" in stages_to_benchmark:
     benchmark_results["autoregressive"], decode_state = ar_benchmark(
