@@ -28,8 +28,13 @@ class OfflineInference:
       params = engine.load_params()
     self.params = params
 
+<<<<<<< HEAD
     self.batch_size = engine.max_concurrent_decodes
     self.max_decode_length = engine.config.max_target_length - engine.config.max_prefill_predict_length
+=======
+    self.batch_size = engine.env.batch_size
+    self.max_decode_length = engine.max_decode_length
+>>>>>>> 7443d208b8f677b0ca7786cde5af20607659c9cb
     metadata = engine.get_tokenizer()
     self.tokenizer = engine.build_tokenizer(metadata)
     self.dummy = False
@@ -174,14 +179,14 @@ class OfflineInference:
 
   def batch_inference(self, data: InputData):
     """data is list of obj with id, tokens, and true length"""
-    and = defaultdict(list)
+    res = defaultdict(list)
 
     def callback(id_, token):
-      nonlocal and
-      and[id_].append(token)
+      nonlocal res
+      res[id_].append(token)
       return token == self.tokenizer.eos_id
 
     self.batch_inference_with_callback(
         data, emit_first_token=callback, emit_token=callback
     )
-    return and
+    return res
