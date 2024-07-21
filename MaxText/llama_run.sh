@@ -37,7 +37,6 @@ echo "USER_CONFIG: ${USER_CONFIG}"
 
 python -m offline_mode \
   --mlperf_test_mode=$1 \
-  # --model_name={MODEL_NAME} \
 	--input_mode tokenized \
         --output_mode tokenized \
 	--mlperf_conf $BASEDIR/mlperf.conf \

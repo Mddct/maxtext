@@ -246,10 +246,10 @@ def make_response(id_, response_token_ids):
 
 def _count_by_bucket(dataset):
 
-  total_len = dataset.tok_input_len + dataset.tok_ref_output_len
+  total_len = dataset.tok_input_length + dataset.tok_output_length
 
-  group1 = total_len <= 512
-  group2 = (total_len <= 1280) & (dataset.tok_input_len <= 1024)
+  group1 = (total_len <= 512) & (dataset.tok_input_length <= 256)
+  group2 = (total_len <= 1024) & (dataset.tok_input_length <= 512)
 
   # with 5 percent extra
   mult = FLAGS.total_sample_count / len(dataset) * 1.05

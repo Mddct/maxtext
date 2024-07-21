@@ -473,5 +473,5 @@ def create_engine_from_config_flags(batch_size, max_prefill_predict_length, max_
   args.append(f"per_device_batch_size={batch_size}")
 
   pyconfig.initialize(args)
-  engine = maxengine.MaxEngine(pyconfig.config)
+  engine = MaxEngine(pyconfig.config)
   return engine

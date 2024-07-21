@@ -174,14 +174,14 @@ class OfflineInference:
 
   def batch_inference(self, data: InputData):
     """data is list of obj with id, tokens, and true length"""
-    and = defaultdict(list)
+    res = defaultdict(list)
 
     def callback(id_, token):
-      nonlocal and
-      and[id_].append(token)
+      nonlocal res
+      res[id_].append(token)
       return token == self.tokenizer.eos_id
 
     self.batch_inference_with_callback(
         data, emit_first_token=callback, emit_token=callback
     )
-    return and
+    return res
