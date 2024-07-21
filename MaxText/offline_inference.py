@@ -21,11 +21,13 @@ class InputData:
 
 class OfflineInference:
 
-  def __init__(self, engine: engine_api.Engine, params=None):
+  def __init__(self, engine: engine_api.Engine, params, base_engine: engine_api.Engine):
     self.engine = engine
     self.decode_state = None
     if params is None:
       params = engine.load_params()
+    else:
+      self._set_engine_local_vars(engine, base_engine)
     self.params = params
 
     self.batch_size = engine.max_concurrent_decodes
@@ -36,6 +38,13 @@ class OfflineInference:
 
     self._cached_pref = {}
     self._cached_generate = None
+
+  def _set_engine_local_vars(self, engine: engine_api.Engine, base_engine: engine_api.Engine):
+    engine.model.quant.quant_mode = base_engine.model.quant.quant_mode
+    engine.state_mesh_annotations = base_engine.state_mesh_annotations
+    engine.abstract_params = base_engine.abstract_params
+    engine.kv_cache_annotations = base_engine.kv_cache_annotations
+    engine.kv_cache_shardings = base_engine.kv_cache_shardings
 
   def init_decode_state(self):
     if self.decode_state is None:
