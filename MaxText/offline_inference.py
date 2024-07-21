@@ -8,6 +8,7 @@ import numpy as np
 from jetstream.engine import engine_api
 
 import logging
+import max_utils
 
 log = logging.getLogger(__name__)
 
@@ -21,11 +22,13 @@ class InputData:
 
 class OfflineInference:
 
-  def __init__(self, engine: engine_api.Engine, params=None):
+  def __init__(self, engine: engine_api.Engine, params, base_engine: engine_api.Engine):
     self.engine = engine
     self.decode_state = None
     if params is None:
       params = engine.load_params()
+    else:
+      self._set_engine_local_vars(engine, base_engine)
     self.params = params
 
     self.batch_size = engine.max_concurrent_decodes
@@ -37,11 +40,19 @@ class OfflineInference:
     self._cached_pref = {}
     self._cached_generate = None
 
+  def _set_engine_local_vars(self, engine: engine_api.Engine, base_engine: engine_api.Engine):
+    engine.model.quant.quant_mode = base_engine.model.quant.quant_mode
+    engine.state_mesh_annotations = base_engine.state_mesh_annotations
+    engine.abstract_params = base_engine.abstract_params
+    engine.kv_cache_annotations = max_utils.get_kv_cache_annotations(engine.model, engine.config, engine.rng, engine._mesh)
+    engine.kv_cache_shardings = jax.tree_util.tree_map(
+      lambda x: jax.sharding.NamedSharding(engine._mesh, x), engine.kv_cache_annotations)
+
   def init_decode_state(self):
     if self.decode_state is None:
       self.decode_state = self.engine.init_decode_state()
 
-  def warmup(self, max_length=2048):
+  def warmup(self, max_length, warmup_samples):
     self.init_decode_state()
     interesting_buckets = [
         32,
@@ -56,20 +67,8 @@ class OfflineInference:
     for length in interesting_buckets:
       if length > max_length:
         break
-      log.info(f"Compiling prefill: {length}")
-      input_data = jax.ShapeDtypeStruct((length,), jnp.dtype("int32"))
-      self._cached_pref[length] = (
-          jax.jit(self._prefill_insert, donate_argnums=(4,))
-          .lower(self.params, input_data, 0, length - 1, self.decode_state)
-          .compile()
-      )
 
-    log.info(f"Compiling decode")
-    self._cached_generate = (
-        jax.jit(self.engine.generate, donate_argnums=(1,))
-        .lower(self.params, self.decode_state)
-        .compile()
-    )
+    self.batch_inference(warmup_samples)
 
   def _prefill_insert(self, params, tokens, slot, true_length, decode_state):
     """return decodestate."""

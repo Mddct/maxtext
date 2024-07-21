@@ -51,6 +51,21 @@ class DecodeState:
   generate_lengths: jax.Array
   generated_token: jax.Array
 
+class MaxEngineConfig:  # pylint: disable=missing-class-docstring
+  def __init__(self, keys):
+    # self.keys = keys
+    self.__dict__['keys'] = keys
+
+  def __getattr__(self, attr):
+    if attr not in self.keys:
+      raise ValueError(f"Requested key {attr}, not in config")
+    return self.keys[attr]
+
+  def __setattr__(self, attr, value):
+    raise ValueError
+
+  def get_keys(self):
+    return self.keys
 
 class MaxEngine(engine_api.Engine):
   """The computational core of the generative model server.
@@ -441,6 +456,7 @@ class MaxEngine(engine_api.Engine):
     raise NotImplementedError
 
 def create_engine_from_config_flags(batch_size, max_prefill_predict_length, max_target_length):
+  import copy
   import pyconfig
   args_str = "MaxText/maxengine_server.py configs/base.yml"
   args = [b for b in args_str.split(' ') if len(b) > 0]
@@ -473,5 +489,6 @@ def create_engine_from_config_flags(batch_size, max_prefill_predict_length, max_
   args.append(f"per_device_batch_size={batch_size}")
 
   pyconfig.initialize(args)
-  engine = MaxEngine(pyconfig.config)
+  cfg = MaxEngineConfig(copy.deepcopy(pyconfig._config.keys))
+  engine = MaxEngine(cfg)
   return engine

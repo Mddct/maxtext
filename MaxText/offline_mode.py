@@ -135,11 +135,11 @@ def timed(msg):
 def _classify_query(dataset_rows, index):
   # return grouped indexes
   sample = dataset_rows[index][1]
-  input_len = sample.tok_input_len
-  total_len = sample.tok_input_len + sample.tok_ref_output_len
-  if total_len <= 512:
+  input_len = sample.tok_input_length
+  total_len = sample.tok_input_length + sample.tok_output_length
+  if total_len <= 512 and input_len <= 256:
     return 0
-  elif total_len <= 1280 and input_len <= 1024:
+  elif total_len <= 1024 and input_len <= 512:
     return 1
   else:
     return 2
@@ -152,6 +152,30 @@ def _pick_batch_size(num_samples, max_batch, dataset_size, sample_size):
   mult = math.ceil(num_samples / max_batch)
   return math.ceil(num_samples / mult * (sample_size / dataset_size))
 
+def get_warmup_samples(dataset):
+  groupped_queries = [[], [], []] 
+  pandas_rows = list(dataset.iterrows())
+  input_data = {}
+  for sample_id in range(len(pandas_rows)):
+    p = pandas_rows[sample_id][1]
+    padded, length = pad_tokens(p.tok_input)
+    input_data[sample_id] = offline_inference.InputData(
+        "", jnp.array(padded), length  # to be filled later
+    )
+  for data in input_data.values():
+    # make sure tokens are transferred to device
+    jax.block_until_ready(data.tokens)
+  sample_id_to_input = input_data 
+  for sample_id in range(len(input_data)):
+    group = _classify_query(pandas_rows, sample_id)  
+    input_ = copy.copy(sample_id_to_input[sample_id])
+    input_.id = sample_id
+    groupped_queries[group].append(input_)
+
+  warmup_samples = [[], [], []]
+  for group_idx, group in enumerate(groupped_queries):
+    warmup_samples[group_idx] = group[:20]
+  return warmup_samples
 
 class SUT:
 
@@ -173,6 +197,7 @@ class SUT:
     self._groupped_queries = [[], [], []]
 
   def issue_queries(self, queries):
+    log.info("Issue queries start")
     assert self._sample_id_to_input is not None
     self._processed_data = []
     self._queries = queries
@@ -182,14 +207,17 @@ class SUT:
       input_data.id = q.id
       self._groupped_queries[group].append(input_data)
 
+    log.info("Issue queries - classified queries")
     assert len(self._queries) == sum(len(q) for q in self._groupped_queries)
     # At this point _processed_data is ready
+    log.info("Issue queries end")
 
   @timed("flush_queries")
   def flush_queries(self):
+    log.info("Flush queries start")
     start = time.perf_counter()
-    jax.profiler.start_trace("/mnt/disks/hanq/jax_profile")
     for group_idx, group in enumerate(self._groupped_queries):
+      log.info(f"Flush queries processing {group_idx} with {len(group)} samples")
       self.offline_inf[group_idx].init_decode_state()
       result = self.offline_inf[group_idx].batch_inference(group)
       self.offline_inf[group_idx].decode_state = None
@@ -199,8 +227,8 @@ class SUT:
         lg.FirstTokenComplete([make_response(key, [val[0]])])
         resp = make_response(key, val)
         lg.QuerySamplesComplete([resp])
-    jax.profiler.stop_trace()
 
+    log.info("Flush queries end")
     end = time.perf_counter()
 
   def LoadSamplesToRam(self, sample_list):
@@ -261,7 +289,6 @@ def _count_by_bucket(dataset):
   ]
   return counts
 
-
 def main(argv):
   del argv
   args = FLAGS
@@ -290,26 +317,32 @@ def main(argv):
   )
   engines = []
   params = None
+  base_engine = None
   for i, (length, max_batch) in enumerate(length_and_batch):
     batch = counts_by_bucket[i]
     target_length = 2*length
     log.info(f"Using batch size: {max_batch} and length: {length}")
     engine = create_engine_from_config_flags(
-      batch_size=batch,
+      batch_size=max_batch,
       max_prefill_predict_length=length,
       max_target_length=target_length)
-    offline_inf = offline_inference.OfflineInference(engine, params)
+    offline_inf = offline_inference.OfflineInference(engine, params, base_engine)
+    if params is None and offline_inf.params is not None:
+      base_engine = engine
     # offline_inf.dummy = True
     params = offline_inf.params
     engines.append(offline_inf)
 
+  warmup_samples = get_warmup_samples(dataset)
   with timed("warmup"):
+    warmup_grp = 0
     for (length, _), engine in zip(length_and_batch, engines):
       log.info(f"warm up for {length}")
       engine.init_decode_state()
-      engine.warmup(length)
+      engine.warmup(length, warmup_samples[warmup_grp])
       engine.decode_state = None  # drop state
       gc.collect()
+      warmup_grp += 1
 
   sut = SUT(dataset, engines)
 
