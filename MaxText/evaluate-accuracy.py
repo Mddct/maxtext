@@ -46,7 +46,7 @@ def main():
     args = get_args()
     dataset_path = args.dataset_file
     checkpoint_path = args.checkpoint_path
-    metric = evaluate.load("rogue")
+    metric = evaluate.load("rouge")
     nltk.download('punkt')
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -82,7 +82,7 @@ def main():
         target_required.append(target)
         pred = np.frombuffer( bytes.fromhex(pred['data']), eval_dtype)
         if pred[0] > 32000 or pred[0] < 0:
-            pred = pred[1:]
+            pred = [1, *pred[1:]]
         gen_tok_len += len(pred)
         preds_token_ids.append(pred)
 
