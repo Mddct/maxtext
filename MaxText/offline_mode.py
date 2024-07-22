@@ -136,9 +136,7 @@ def _classify_query(dataset_rows, index):
   # return grouped indexes
   sample = dataset_rows[index][1]
   input_len = sample.tok_input_length
-  total_len = sample.tok_input_length + sample.tok_output_length
-  total_len = int(1.1 * total_len)
-  input_len = int(1.1 * input_len)
+  total_len = sample.tok_input_length + 2.5*sample.tok_output_length
   if total_len <= 512 and input_len <= 256:
     return 0
   elif total_len <= 1024 and input_len <= 512:

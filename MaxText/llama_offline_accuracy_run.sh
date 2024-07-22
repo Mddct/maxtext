@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 me=$(basename "$0")
 
-BASEDIR=/home/vipannalla/inference_mlperf4.1
+if [ -z "$BASEDIR"];
+then
+  BASEDIR=/home/vipannalla/inference_mlperf4.1
+fi
+
 USER_CONFIG=$BASEDIR/language/llama2-70b/tpu/user.conf
-DATA_DISK_DIR=/home/vipannalla/loadgen_run_data
+
+if [ -z "$DATA_DISK_DIR"];
+then
+  DATA_DISK_DIR=/home/vipannalla/loadgen_run_data
+fi
+
 DATASET_PATH=${DATA_DISK_DIR}/processed-data.pkl
 TOTAL_SAMPLE_COUNT=1000
 LOG_INTERVAL=200
@@ -18,7 +27,7 @@ LOADGEN_RUN_TIMESTAMP=$(TZ=America/Los_Angeles date +%Y%m%d%H%M%S%Z)
 OUTPUT_LOG_ID=${MODEL_NAME}-${DATASET_TYPE}-${LOADGEN_RUN_TYPE}-${LOADGEN_RUN_TIMESTAMP}
 OUTPUT_LOG_DIR=${DATA_DISK_DIR}/logs/${OUTPUT_LOG_ID}
 
-mkdir -p ${OUTPUT_LOG_DIR} && cp ../${USER_CONFIG} ${OUTPUT_LOG_DIR}
+mkdir -p ${OUTPUT_LOG_DIR} && cp ${USER_CONFIG} ${OUTPUT_LOG_DIR}
 
 OUTPUT_ACCURACY_JSON_PATH=${OUTPUT_LOG_DIR}/mlperf_log_accuracy.json
 
