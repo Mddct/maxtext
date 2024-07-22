@@ -26,6 +26,7 @@ from input_pipeline._tfds_data_processing import make_tfds_iterator
 from input_pipeline._grain_data_processing import make_grain_iterator
 from input_pipeline._tfds_data_processing_c4_mlperf import make_c4_mlperf_train_iterator, make_c4_mlperf_eval_iterator
 from input_pipeline._hf_data_processing import make_hf_iterator
+from input_pipeline._input_pipeline_utils import get_tokenizer
 import multihost_dataloading
 
 
