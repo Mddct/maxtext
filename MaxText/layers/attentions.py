@@ -25,7 +25,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import shard_map
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
-from kernels.ragged_attention import mqa_reference, ragged_mqa
+from kernels.ragged_attention import mqa_reference, ragged_mqa, ragged_mqa_2
 import jax.numpy as jnp
 
 import common_types
@@ -210,6 +210,36 @@ class AttentionOp(nn.Module):
       return self.cudnn_flash_attention(query, key, value, decoder_segment_ids, model_mode), None, None
     else:
       raise ValueError(f"Unexpected attention kernel {self.attention_kernel=}.")
+
+  def ragged_attention_2(self, query: Array, key: Array, value: Array, lengths: Array) -> tuple[Array, Array, Array]:
+    """Ragged Attention."""
+    # jax.debug.print("lengths: {}", lengths)
+    ragged_qkv = nn.logical_to_mesh_axes(self.cache_logical_axis_names)
+    ragged_lengths = nn.logical_to_mesh_axes(self.ragged_lengths_names)
+    @functools.partial(
+        shard_map,
+        mesh=self.mesh,
+        in_specs=(
+            ragged_qkv,
+            ragged_qkv,
+            ragged_qkv,
+            ragged_lengths,
+        ),
+        out_specs=ragged_qkv,
+        check_rep=False,
+    )
+    def wrap_ragged_attention_2(query, key, value, lengths):
+      # vmap_ragged_mqa = jax.vmap(ragged_mqa, in_axes=[1, 1, 1, None], out_axes=2)
+      o, m, l  = ragged_mqa_2(query, key, value, lengths)
+      m = jnp.expand_dims(m, axis=-1)
+      l = jnp.expand_dims(l, axis=-1)
+      o = o * l 
+      return o, m, l
+
+    # query = jnp.swapaxes(query, 1, 2)
+    # key = jnp.swapaxes(key, 1, 2)
+    # value = jnp.swapaxes(value, 1, 2)
+    return wrap_ragged_attention_2(query, key, value, lengths)
   
   def ragged_attention(self, query: Array, key: Array, value: Array, lengths: Array) -> tuple[Array, Array, Array]:
     """Ragged Attention."""
@@ -232,27 +262,14 @@ class AttentionOp(nn.Module):
     def wrap_ragged_attention(query, key, value, lengths):
       vmap_ragged_mqa = jax.vmap(ragged_mqa, in_axes=[1, 1, 1, None], out_axes=2)
       o, m, l  = vmap_ragged_mqa(query, key, value, lengths)
-      # ragged_attention - before o.shape=(64, 1, 8, 128)
-      # ragged_attention - before m.shape=(64, 1, 8)
-      # ragged_attention - before l.shape=(64, 1, 8)
       m = jnp.expand_dims(m, axis=-1)
       l = jnp.expand_dims(l, axis=-1)
       o = o * l 
-      # ragged_attention - after o.shape=(64, 1, 8, 128)
-      # ragged_attention - after m.shape=(64, 1, 8, 1)
-      # ragged_attention - after l.shape=(64, 1, 8, 1)
       return o, m, l
 
-    # ragged_attention - before query.shape=(64, 1, 32, 128)
-    # ragged_attention - before key.shape=(64, 1024, 32, 128)
-    # ragged_attention - before value.shape=(64, 1024, 32, 128)
-    # ragged_attention - lengths.shape=(64,)
     query = jnp.swapaxes(query, 1, 2)
     key = jnp.swapaxes(key, 1, 2)
     value = jnp.swapaxes(value, 1, 2)
-    # ragged_attention - after query.shape=(64, 32, 1, 128)
-    # ragged_attention - after key.shape=(64, 32, 1024, 128)
-    # ragged_attention - after value.shape=(64, 32, 1024, 128)
     return wrap_ragged_attention(query, key, value, lengths)
 
   def tpu_flash_attention(self, query: Array, key: Array, value: Array, decoder_segment_ids: Array | None) -> Array:
