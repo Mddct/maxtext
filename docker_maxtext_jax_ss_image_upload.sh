@@ -59,18 +59,24 @@ if [[ ! -v MAXTEXT_REQUIREMENTS_FILE ]]; then
   exit 1
 fi
 
+gcloud auth configure-docker us-docker.pkg.dev --quiet
+
 COMMIT_HASH=$(git rev-parse --short HEAD)
 
 echo "Building JAX SS MaxText at commit hash ${COMMIT_HASH} . . ."  
+
+IMAGE_DATE=$(date +%Y-%m-%d)
+
+FULL_IMAGE_TAG=${IMAGE_TAG}-${IMAGE_DATE}
 
 docker build \
   --build-arg JAX_SS_BASEIMAGE=${BASEIMAGE} \
   --build-arg COMMIT_HASH=${COMMIT_HASH} \
   --build-arg MAXTEXT_REQUIREMENTS_FILE=${MAXTEXT_REQUIREMENTS_FILE} \
   --network=host \
-  -t gcr.io/${PROJECT_ID}/${CLOUD_IMAGE_NAME}:${IMAGE_TAG} \
+  -t gcr.io/${PROJECT_ID}/${CLOUD_IMAGE_NAME}:${FULL_IMAGE_TAG} \
   -f ./maxtext_jax_ss_tpu.Dockerfile .
 
-docker push gcr.io/${PROJECT_ID}/${CLOUD_IMAGE_NAME}:${IMAGE_TAG}
+docker push gcr.io/${PROJECT_ID}/${CLOUD_IMAGE_NAME}:${FULL_IMAGE_TAG}
 
-echo "All done, check out your artifacts at: gcr.io/${PROJECT_ID}/${CLOUD_IMAGE_NAME}:${IMAGE_TAG}"
+echo "All done, check out your artifacts at: gcr.io/${PROJECT_ID}/${CLOUD_IMAGE_NAME}:${FULL_IMAGE_TAG}"
