@@ -174,7 +174,7 @@ def get_warmup_samples(dataset):
 
   warmup_samples = [[], [], []]
   for group_idx, group in enumerate(groupped_queries):
-    warmup_samples[group_idx] = group[:20]
+    warmup_samples[group_idx] = group[:50]
   return warmup_samples
 
 class SUT:
