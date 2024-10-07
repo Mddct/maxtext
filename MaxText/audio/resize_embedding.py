@@ -1,6 +1,5 @@
 # resize embedding and lm head for audio from maxtext's checkpoint
 import argparse
-import sys
 
 import flax.linen as nn
 import jax
@@ -89,7 +88,6 @@ def main(checkpoint_path, new_tokens, save_to, step=0):
         0,
         args=orbax.checkpoint.args.Composite(
             items=orbax.checkpoint.args.PyTreeSave(item=state_new)),
-        force=True,
     )
     save_checkpointer.wait_until_finished()
 

@@ -80,8 +80,9 @@ def get_next_batch_sharded(local_iterator: Iterator, global_mesh: Mesh) -> jax.A
     except tf.errors.FailedPreconditionError:
       max_logging.log("Failed to get next data batch, retrying")
       time.sleep(SLEEP_TIME)
-    except Exception as e:
-        pass
+    except StopIteration:
+      break
+
 
   # Try one last time, if this fails we will see the full stack trace.
   if not loaded_data_success:
