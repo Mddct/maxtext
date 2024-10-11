@@ -16,6 +16,7 @@ limitations under the License.
 """Input pipeline using wenet datapipes."""
 
 import glob
+import json
 from functools import partial
 from typing import Dict, List
 
@@ -31,11 +32,22 @@ from input_pipeline.wenet_datapipes.maxtext_datapipes import \
     MaxTextWenetRawDatasetSource
 
 
-def tokenizeOp(sample, tokenizer):
+def tokenizeOp(sample, tokenizer: HuggingFaceTokenizer, add_bos, add_eos):
     """pretrain
     """
-    text = sample['text']
+    obj = json.loads(sample['line'])
+    text = obj['txt']
     tokens, ids = tokenizer.tokenize(text)
+    if add_bos:
+        bos_id = tokenizer.tokenizer.bos_token_id
+        bos_token = tokenizer.ids2tokens([bos_id])[0]
+        tokens = [bos_token] + tokens
+        ids = [bos_id] + ids
+    if add_eos:
+        eos_id = tokenizer.tokenizer.eos_token_id
+        eos_token = tokenizer.ids2tokens([eos_id])[0]
+        tokens = tokens + [eos_token]
+        ids = ids + [eos_id]
     sample['tokens'] = tokens
     sample['input'] = ids
     sample['output'] = ids
@@ -83,8 +95,8 @@ def padding_fn(data: List[Dict]):
     """
 
     samples = data
-    inputs = [sample['input_ids'] for sample in samples]
-    outputs = [sample['output_ids'] for sample in samples]
+    inputs = [sample['input'] for sample in samples]
+    outputs = [sample['output'] for sample in samples]
     inputs = pad_sequence(inputs, batch_first=True, padding_value=0)
     outputs = pad_sequence(outputs, batch_first=True, padding_value=0)
 
@@ -134,11 +146,14 @@ def preprocessing_pipeline(
     """Use grain to pre-process the dataset and return iterators"""
     assert global_batch_size % global_mesh.size == 0, "Batch size should be divisible number of global devices."
     if tokenize:
-        tokenizer = HuggingFaceTokenizer(model=tokenizer_path,
-                                         add_bos_token=add_bos,
-                                         add_eos_token=add_eos)
-
+        tokenizer = HuggingFaceTokenizer(model=tokenizer_path)
         dataset = dataset.map(partial(tokenizeOp, tokenizer=tokenizer))
+        dataset = dataset.map(
+            partial(tokenizeOp,
+                    tokenizer=tokenizer,
+                    add_bos=add_bos,
+                    add_eos=add_eos))
+
     dataset = dataset.map(partial(trim, max_length=max_target_length + 1))
     if stage2_shuffle:
         dataset = dataset.shuffle(shuffle_size)
