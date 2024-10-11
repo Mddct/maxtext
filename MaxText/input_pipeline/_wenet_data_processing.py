@@ -29,8 +29,6 @@ from MaxText.input_pipeline.wenet_datapipes.maxtext_datapipes import \
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 
-from input_pipeline import _grain_tokenizer, _input_pipeline_utils
-
 
 def tokenizeOp(sample, tokenizer):
     """pretrain
@@ -62,18 +60,14 @@ def shift(sample):
     return sample
 
 
-def get_datasets(data_file_pattern, shuffle, epoch, prefetch,
-                 num_of_instances_in_cluster, instance_id):
+def get_datasets(data_file_pattern, shuffle, epoch, prefetch):
     """Load dataset from array_record files for using with grain"""
     data_files = glob.glob(data_file_pattern)
-    dataset = MaxTextWenetRawDatasetSource(
-        data_files,
-        prefetch,
-        shuffle,
-        100000,
-        cycle=epoch,
-        num_of_instances_in_cluster=num_of_instances_in_cluster,
-        instance_id=instance_id)
+    dataset = MaxTextWenetRawDatasetSource(data_files,
+                                           prefetch,
+                                           shuffle,
+                                           100000,
+                                           cycle=epoch)
     return dataset
 
 
@@ -90,6 +84,9 @@ def padding_fn(data: List[Dict]):
     samples = data
     inputs = [sample['input_ids'] for sample in samples]
     outputs = [sample['output_ids'] for sample in samples]
+    inputs = pad_sequence(inputs, batch_first=True, padding_value=0)
+    outputs = pad_sequence(outputs, batch_first=True, padding_value=0)
+
     batch = {
         "inputs": inputs.numpy(force=True),
         "targets": outputs.numpy(force=True),
@@ -103,6 +100,8 @@ def preprocessing_pipeline(
     tokenizer_path,
     global_batch_size: int,
     max_target_length: int,
+    dataloading_host_index: int,
+    dataloading_host_count: int,
     tokenize=True,
     add_bos=True,
     add_eos=True,
@@ -134,6 +133,16 @@ def preprocessing_pipeline(
         dataset = dataset.batch(global_batch_size // jax.process_count(),
                                 drop_last=drop_remainder,
                                 wrapper_class=padding_fn)
+
+    def worker_init_fn(worker_id):
+        total_wokers_in_cluster = dataloading_host_count * num_workers
+        worker_id_in_cluster = worker_id + dataloading_host_index
+        info = torch.utils.data.get_worker_info()
+        assert info is not None
+        datapipe = info.dataset
+        torch.utils.data.graph_settings.apply_sharding(
+            datapipe, total_wokers_in_cluster, worker_id_in_cluster)
+
     generator = torch.Generator()
     generator.manual_seed(seed)
 
@@ -143,7 +152,8 @@ def preprocessing_pipeline(
                             persistent_workers=True,
                             generator=generator,
                             collate_fn=lambda batch: batch,
-                            prefetch_factor=dataloader_prefetch)
+                            prefetch_factor=dataloader_prefetch,
+                            worker_init_fn=worker_init_fn)
     multihost_gen = multihost_dataloading.MultiHostDataLoadIterator(
         dataloader, global_mesh)
 
@@ -164,14 +174,8 @@ def make_wenet_dataset_iterator(
 
     dataloading_host_index = process_indices.index(jax.process_index()),
     dataloading_host_count = len(process_indices),
-    train_ds = get_datasets(
-        config.wenet_train_files,
-        True,
-        epoch,
-        config.first_prefetch,
-        num_of_instances_in_cluster=dataloading_host_count *
-        config.wenet_worker_count,
-        instance_id=dataloading_host_index)
+    train_ds = get_datasets(config.wenet_train_files, True, epoch,
+                            config.first_prefetch)
 
     train_iter = preprocessing_pipeline(
         dataset=train_ds,
@@ -184,18 +188,13 @@ def make_wenet_dataset_iterator(
         tokenize=config.tokenize_train_data,
         add_bos=config.add_bos,
         add_eos=config.add_eos,
+        dataloading_host_index=dataloading_host_index,
+        dataloading_host_count=dataloading_host_count,
     )
 
     if config.eval_interval > 0:
-        eval_ds = get_datasets(
-            config.wenet_train_files,
-            False,
-            1,
-            config.first_prefetch,
-            num_of_instances_in_cluster=dataloading_host_count *
-            config.wenet_worker_count,
-            instance_id=dataloading_host_index)
-
+        eval_ds = get_datasets(config.wenet_train_files, False, 1,
+                               config.first_prefetch)
         eval_iter = preprocessing_pipeline(
             dataset=eval_ds,
             tokenizer_path=config.tokenizer_path,
@@ -207,6 +206,8 @@ def make_wenet_dataset_iterator(
             tokenize=config.tokenize_train_data,
             add_bos=config.add_bos,
             add_eos=config.add_eos,
+            dataloading_host_index=dataloading_host_index,
+            dataloading_host_count=dataloading_host_count,
         )
 
     else:
