@@ -23,11 +23,12 @@ import jax
 import ml_collections
 import multihost_dataloading
 import torch
-from MaxText.input_pipeline._wenet_tokenizer import HuggingFaceTokenizer
-from MaxText.input_pipeline.wenet_datapipes.maxtext_datapipes import \
-    MaxTextWenetRawDatasetSource
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
+
+from input_pipeline._wenet_tokenizer import HuggingFaceTokenizer
+from input_pipeline.wenet_datapipes.maxtext_datapipes import \
+    MaxTextWenetRawDatasetSource
 
 
 def tokenizeOp(sample, tokenizer):
@@ -94,6 +95,22 @@ def padding_fn(data: List[Dict]):
     return batch
 
 
+def _worker_init_fn(worker_id, dataloading_host_count, dataloading_host_index,
+                    num_workers):
+    total_wokers_in_cluster = dataloading_host_count * num_workers
+    worker_id_in_cluster = worker_id + dataloading_host_index
+    info = torch.utils.data.get_worker_info()
+    assert info is not None
+    datapipe = info.dataset
+    torch.utils.data.graph_settings.apply_sharding(datapipe,
+                                                   total_wokers_in_cluster,
+                                                   worker_id_in_cluster)
+
+
+def _batch_fn(batch):
+    return batch
+
+
 def preprocessing_pipeline(
     global_mesh,
     dataset,
@@ -134,24 +151,20 @@ def preprocessing_pipeline(
                                 drop_last=drop_remainder,
                                 wrapper_class=padding_fn)
 
-    def worker_init_fn(worker_id):
-        total_wokers_in_cluster = dataloading_host_count * num_workers
-        worker_id_in_cluster = worker_id + dataloading_host_index
-        info = torch.utils.data.get_worker_info()
-        assert info is not None
-        datapipe = info.dataset
-        torch.utils.data.graph_settings.apply_sharding(
-            datapipe, total_wokers_in_cluster, worker_id_in_cluster)
-
+    worker_init_fn = partial(
+        _worker_init_fn,
+        dataloading_host_count=dataloading_host_count,
+        dataloading_host_index=dataloading_host_index,
+        num_workers=num_workers,
+    )
     generator = torch.Generator()
     generator.manual_seed(seed)
-
     dataloader = DataLoader(dataset,
                             batch_size=None,
                             num_workers=num_workers,
                             persistent_workers=True,
                             generator=generator,
-                            collate_fn=lambda batch: batch,
+                            collate_fn=_batch_fn,
                             prefetch_factor=dataloader_prefetch,
                             worker_init_fn=worker_init_fn)
     multihost_gen = multihost_dataloading.MultiHostDataLoadIterator(

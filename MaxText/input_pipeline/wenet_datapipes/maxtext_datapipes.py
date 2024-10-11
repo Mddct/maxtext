@@ -18,7 +18,7 @@ class MaxTextWenetRawDatasetSource(IterDataPipe):
         if shuffle:
             self.dp = self.dp.shuffle(buffer_size=shuffle_size)
         self.dp = self.dp.repeat(cycle).prefetch(prefetch)
-        self.dp = self.dp.sharding_filte()
+        self.dp = self.dp.sharding_filter()
 
     def __iter__(self):
         for d in self.dp:

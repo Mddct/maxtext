@@ -15,22 +15,20 @@
 # Copy from https://github.com/wenet-e2e/wenet/tree/main/wenet/dataset
 
 import collections
-from collections.abc import Callable
 import copy
+import logging
 import sys
 import tarfile
-import logging
+from collections.abc import Callable
 from typing import List, Optional
+
 import numpy as np
 import torch
-from torch.utils.data import IterDataPipe, functional_datapipe
-from torch.utils.data import datapipes
+from torch.utils.data import IterDataPipe, datapipes, functional_datapipe
 from torch.utils.data.datapipes.iter import Mapper
 from torch.utils.data.datapipes.iter.sharding import (
     SHARDING_PRIORITIES, ShardingFilterIterDataPipe)
 from torch.utils.data.datapipes.utils.common import _check_unpickable_fn
-
-from wenet.dataset.processor import parse_url
 
 
 @functional_datapipe("map_ignore_error")
@@ -364,71 +362,6 @@ class TextLineDataPipe(IterDataPipe):
             stream.close()
 
 
-@functional_datapipe("tar_file_and_group")
-class TarsDataPipe(IterDataPipe):
-    """ Decode wenet's tar , yield {'txt': "...", "raw": "..."}
-    """
-
-    def __init__(self, dataset: IterDataPipe) -> None:
-        super().__init__()
-        self.dp = dataset
-
-    def __iter__(self):
-        from wenet.dataset.processor import AUDIO_FORMAT_SETS
-        for sample in self.dp:
-            assert 'file_name' in sample
-            assert 'line' in sample
-            assert 'stream' in sample
-            try:
-                with tarfile.open(fileobj=sample['stream'],
-                                  mode="r:*") as stream:
-                    prev_prefix = None
-                    example = {
-                        'file_name': sample['file_name'],
-                        'tar_file_name': sample['line']
-                    }
-                    valid = True
-                    for tarinfo in stream:
-                        name = tarinfo.name
-                        pos = name.rfind('.')
-                        assert pos > 0
-                        prefix, postfix = name[:pos], name[pos + 1:]
-                        if prev_prefix is not None and prefix != prev_prefix:
-                            example['key'] = prev_prefix
-                            if valid:
-                                yield example
-                            example = {
-                                'file_name': sample['file_name'],
-                                'tar_file_name': sample['line']
-                            }
-                            valid = True
-                        with stream.extractfile(tarinfo) as file_obj:
-                            try:
-                                if postfix == 'txt':
-                                    example['txt'] = file_obj.read().decode(
-                                        'utf8').strip()
-                                elif postfix in AUDIO_FORMAT_SETS:
-                                    example['wav'] = file_obj.read()
-                                else:
-                                    example[postfix] = file_obj.read()
-                            except Exception as ex:
-                                valid = False
-                                logging.warning(
-                                    'error to parse {}'.format(name))
-                            prev_prefix = prefix
-                    if prev_prefix is not None:
-                        example['key'] = prev_prefix
-                        yield example
-            except Exception as ex:
-                msg = 'In tar_file_and_group: {} when processing {}'.format(
-                    ex, sample['line'])
-                logging.warning(msg)
-            finally:
-                if 'process' in sample:
-                    sample['process'].communicate()
-                sample['stream'].close()
-
-
 class WenetRawDatasetSource(IterDataPipe):
 
     def __init__(self,
@@ -444,28 +377,6 @@ class WenetRawDatasetSource(IterDataPipe):
             self.dp = self.dp.shuffle(buffer_size=shuffle_size)
         self.dp = self.dp.repeat(cycle).prefetch(prefetch)
         self.dp = self.dp.shard(partition)
-
-    def __iter__(self):
-        for d in self.dp:
-            yield d
-
-
-class WenetTarShardDatasetSource(IterDataPipe):
-
-    def __init__(self,
-                 filenames: str,
-                 prefetch: int = 500,
-                 partition: bool = True,
-                 shuffle: bool = False,
-                 shuffle_size: int = 10000,
-                 cycle: int = 1) -> None:
-        super().__init__()
-        self.dp = TextLineDataPipe(filenames)
-        if shuffle:
-            self.dp = self.dp.shuffle(buffer_size=shuffle_size)
-        self.dp = self.dp.repeat(cycle)
-        self.dp = self.dp.shard(partition).map_ignore_error(
-            parse_url).tar_file_and_group().prefetch(prefetch)
 
     def __iter__(self):
         for d in self.dp:
