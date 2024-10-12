@@ -25,7 +25,6 @@ def get_args():
                         default=0,
                         help='audio max token id')
     parser.add_argument('--audio_max_id',
-                        required=True,
                         type=int,
                         default=10000,
                         help='audio max token id')
@@ -35,6 +34,9 @@ def get_args():
 
 def main():
     args = get_args()
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s - %(message)s')
+
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model,
