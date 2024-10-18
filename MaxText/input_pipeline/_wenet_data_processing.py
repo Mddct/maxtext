@@ -37,7 +37,7 @@ def tokenizeOp(sample, tokenizer: HuggingFaceTokenizer, add_bos, add_eos):
     """
     obj = json.loads(sample['line'])
     text = obj['txt']
-    tokens, ids = tokenizer.tokenize(text)
+    _, ids = tokenizer.tokenize(text)
     if add_bos:
         bos_id = tokenizer.tokenizer.bos_token_id
         bos_token = tokenizer.ids2tokens([bos_id])[0]
@@ -48,33 +48,65 @@ def tokenizeOp(sample, tokenizer: HuggingFaceTokenizer, add_bos, add_eos):
         eos_token = tokenizer.ids2tokens([eos_id])[0]
         tokens = tokens + [eos_token]
         ids = ids + [eos_id]
-    sample['tokens'] = tokens
-    sample['input'] = ids
-    sample['output'] = ids
     return {
         'input': torch.tensor(ids),
-        'output': torch.tensor(ids),
+        'target': torch.tensor(ids),
     }
 
 
 def trim(sample, max_length):
-    sample['tokens'] = sample['tokens'][:max_length]
     sample['input'] = sample['input'][:max_length]
-    sample['output'] = sample['output'][:max_length]
+    sample['target'] = sample['target'][:max_length]
     return sample
 
 
 def shift(sample):
     input_ids = sample['input']
-    output_ids = sample['output']
+    target_ids = sample['target']
 
     sample['input'] = input_ids[:-1]
-    sample['output'] = output_ids[1:]
+    sample['target'] = target_ids[1:]
+    return sample
+
+
+def pad_to_max_length(sample, max_length):
+
+    def _pad(x):
+        pad_amount = max(max_length - x.shape[0], 0)
+        return torch.nn.functional.pad(x, (0, pad_amount), 0)
+
+    sample["input_segmentation"] = torch.ones(
+        sample["input"].shape,
+        dtype=torch.int32,
+    )
+    sample["input_position"] = torch.arange(
+        sample["input"].shape[0],
+        dtype=torch.int32,
+    )
+    sample["target_segmentation"] = torch.ones(
+        sample["target"].shape,
+        dtype=torch.int32,
+    )
+    sample["target_position"] = torch.arange(
+        sample["target"].shape[0],
+        dtype=torch.int32,
+    )
+
+    keys = {
+        "input",
+        "input_segmentation",
+        "input_position",
+        "target",
+        "target_segmentation",
+        "target_position",
+    }
+    for key in keys:
+        sample[key] = _pad(sample[key])
     return sample
 
 
 def get_datasets(data_file_pattern, shuffle, epoch, prefetch):
-    """Load dataset from array_record files for using with grain"""
+    """Load dataset from array_record files for using with wenet datapipes"""
     data_files = glob.glob(data_file_pattern)
     dataset = MaxTextWenetRawDatasetSource(data_files,
                                            prefetch,
@@ -84,7 +116,7 @@ def get_datasets(data_file_pattern, shuffle, epoch, prefetch):
     return dataset
 
 
-def padding_fn(data: List[Dict]):
+def padding_fn(data: List[Dict], max_length):
     """ Padding the data into training data
 
         Args:
@@ -95,16 +127,40 @@ def padding_fn(data: List[Dict]):
     """
 
     samples = data
+
     inputs = [sample['input'] for sample in samples]
-    outputs = [sample['output'] for sample in samples]
-    inputs = pad_sequence(inputs, batch_first=True, padding_value=0)
-    outputs = pad_sequence(outputs, batch_first=True, padding_value=0)
+    targets = [sample['target'] for sample in samples]
+
+    inputs_position = [sample['input_position'] for sample in samples]
+    inputs_segmentation = [sample['input_segmentation'] for sample in samples]
+    targets_segmentation = [
+        sample['target_segmentation'] for sample in samples
+    ]
+    targets_position = [sample['target_position'] for sample in samples]
+
+    inputs = torch.stack(inputs, dim=0)
+    targets = torch.stack(targets, dim=0)
+    inputs_segmentation = torch.stack(inputs_segmentation, dim=0)
+    targets_segmentation = torch.stack(targets_segmentation, dim=0)
+    inputs_position = torch.stack(inputs_position, dim=0)
+    targets_position = torch.stack(targets_position, dim=0)
 
     batch = {
-        "inputs": inputs.numpy(force=True),
-        "targets": outputs.numpy(force=True),
+        "inputs": inputs,
+        "inputs_position": inputs_position,
+        "inputs_segmentation": inputs_segmentation,
+        "targets": targets,
+        "targets_position": targets_position,
+        "targets_segmentation": targets_segmentation,
     }
     return batch
+
+
+def _batch_fn(batch):
+    to_numpy_batch = {}
+    for name, value in batch.items():
+        to_numpy_batch[name] = value.numpy(force=True)
+    return to_numpy_batch
 
 
 def _worker_init_fn(worker_id, dataloading_host_count, dataloading_host_index,
@@ -117,10 +173,6 @@ def _worker_init_fn(worker_id, dataloading_host_count, dataloading_host_index,
     torch.utils.data.graph_settings.apply_sharding(datapipe,
                                                    total_wokers_in_cluster,
                                                    worker_id_in_cluster)
-
-
-def _batch_fn(batch):
-    return batch
 
 
 def preprocessing_pipeline(
@@ -143,7 +195,7 @@ def preprocessing_pipeline(
     seed: int = 2024,
     dataloader_prefetch: int = 10,
 ):
-    """Use grain to pre-process the dataset and return iterators"""
+    """Use wenet datapipes to pre-process the dataset and return iterators"""
     assert global_batch_size % global_mesh.size == 0, "Batch size should be divisible number of global devices."
     if tokenize:
         tokenizer = HuggingFaceTokenizer(model=tokenizer_path)
@@ -162,6 +214,8 @@ def preprocessing_pipeline(
     if packing:
         pass
     else:
+        dataset = dataset.map(
+            partial(pad_to_max_length, max_length=max_target_length))
         dataset = dataset.batch(global_batch_size // jax.process_count(),
                                 drop_last=drop_remainder,
                                 wrapper_class=padding_fn)
