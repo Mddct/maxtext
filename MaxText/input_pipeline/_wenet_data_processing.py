@@ -24,7 +24,6 @@ import jax
 import ml_collections
 import multihost_dataloading
 import torch
-from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 
 from input_pipeline._wenet_tokenizer import HuggingFaceTokenizer
@@ -129,14 +128,14 @@ def padding_fn(data: List[Dict], max_length):
     samples = data
 
     inputs = [sample['input'] for sample in samples]
-    targets = [sample['target'] for sample in samples]
-
     inputs_position = [sample['input_position'] for sample in samples]
     inputs_segmentation = [sample['input_segmentation'] for sample in samples]
+
+    targets = [sample['target'] for sample in samples]
+    targets_position = [sample['target_position'] for sample in samples]
     targets_segmentation = [
         sample['target_segmentation'] for sample in samples
     ]
-    targets_position = [sample['target_position'] for sample in samples]
 
     inputs = torch.stack(inputs, dim=0)
     targets = torch.stack(targets, dim=0)
@@ -175,6 +174,10 @@ def _worker_init_fn(worker_id, dataloading_host_count, dataloading_host_index,
                                                    worker_id_in_cluster)
 
 
+def to_list(sample):
+    return {k: v.tolist() for (k, v) in sample.items()}
+
+
 def preprocessing_pipeline(
     global_mesh,
     dataset,
@@ -209,16 +212,20 @@ def preprocessing_pipeline(
     dataset = dataset.map(partial(trim, max_length=max_target_length + 1))
     if stage2_shuffle:
         dataset = dataset.shuffle(shuffle_size)
+
     if shift:
         dataset = dataset.map(shift)
+
     if packing:
-        pass
+        dataset = dataset.map(to_list)
+        dataset = dataset.greedy_pack(max_length=max_target_length,
+                                      pad_value=0)
     else:
         dataset = dataset.map(
             partial(pad_to_max_length, max_length=max_target_length))
-        dataset = dataset.batch(global_batch_size // jax.process_count(),
-                                drop_last=drop_remainder,
-                                wrapper_class=padding_fn)
+    dataset = dataset.batch(global_batch_size // jax.process_count(),
+                            drop_last=drop_remainder,
+                            wrapper_class=padding_fn)
 
     worker_init_fn = partial(
         _worker_init_fn,
