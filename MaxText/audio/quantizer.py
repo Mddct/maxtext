@@ -14,9 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from sys import flags
+from typing import Any, Tuple
+import flax
+
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import MaxText.common_types
+from MaxText.layers.attentions import NdInitializer
+from MaxText.layers.gpt3 import DenseGeneral
+from MaxText.layers.initializers import nd_dense_init
+
+Config = MaxText.common_types.DType
 
 
 def compute_code_histogram(onehots: jax.Array, paddings: jax.Array):
@@ -59,24 +69,75 @@ def compute_code_coverage(onehots: jax.Array, paddings: jax.Array):
     return avg_num_covered_words / codebook_size
 
 
+def quantize_vector(
+        latent: jax.Array,
+        codebook: jax.Array) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    """ https://github.com/wenet-e2e/wenet/blob/main/wenet/ssl/bestrq/bestrq_model.py
+    """
+
+    v, g, h = codebook.shape
+    # Calculate distance
+    distance = (jnp.sum(latent**2, axis=-1, keepdims=True) -
+                2 * jnp.einsum("...gh,vgh->...gv", latent, codebook) +
+                jnp.sum(codebook**2, axis=-1).T)
+    codes = jnp.argmin(distance, axis=-1)
+    onehot = jax.nn.one_hot(codes, v, axis=-1)
+    quantized = jnp.einsum("...gv,vgh->...gh", onehot, codebook)
+    return quantized, codes, onehot
+
+
+def _l2_normalize(x: jax.Array,
+                  axis: int,
+                  epsilon: float = 1e-12) -> jax.Array:
+    return x / jnp.sqrt(jnp.sum(x**2, axis=axis, keepdims=True) + epsilon)
+
+
 class RandomVectorQuantizer(nn.Module):
+    config: Config
     input_dim: int
+    num_groups: int
     num_codebooks: int
     codebook_dim: int
-    normalize_codebook: bool = True
     normalize_inputs: bool = True
     codebook_init_std: float = 1.0
+    kernel_axes: Tuple[str, ...] = ()
+    dtype: Any = jnp.float32
+    weight_dtype: Any = jnp.float32
+
+    normalize_codebook: bool = False
+    normalize_latent_vector: bool = False
+    normalize_latent_per_group: bool = True
+
+
+    # xavier init
+    random_proj_init: NdInitializer = nd_dense_init(
+        1.0, mode='fan_avg', distribution='truncated_normal')
+
+    # noram init
+    random_codebook_init: NdInitializer = nn.initializers.normal(stddev=1.0),
 
     def setup(self):
         # Initialize the random projection layer
-        self.rand_proj = nn.Dense(features=self.num_codebooks *
-                                  self.codebook_dim,
-                                  use_bias=False,
-                                  kernel_init=nn.initializers.xavier_uniform())
+        self.rand_proj = DenseGeneral(
+            axis=-1,
+            name='random_projection',
+            features=(self.input_dim, self.num_groups * self.codebook_dim),
+            dtype=self.dtype,
+            weight_dtype=self.weight_dtype,
+            kernel_init=self.random_proj_init,
+            kernel_axes=('embed', 'mlp'),
+            quant=None,
+            use_bias=False,
+            matmul_precision=self.config.matmul_precision,
+        )
         # Initialize and freeze the codebook
+        kernel_axes=('codebooks', 'code_gorups', 'codebook_dim')
         self.codebook = self.param(
-            "codebook", nn.initializers.normal(stddev=self.codebook_init_std),
-            (self.num_codebooks, self.codebook_dim))
+            'codebooks',
+            nn.with_logical_partitioning(self.random_codebook_init, kernel_axes),
+            (self.num_codebooks, self.num_groups, self.codebook_dim),
+            self.weight_dtype,
+        )
         # Normalize codebook if enabled
         if self.normalize_codebook:
             self.codebook = self.codebook / (
@@ -84,38 +145,31 @@ class RandomVectorQuantizer(nn.Module):
 
     def __call__(self, inputs, paddings):
         # Compute random projection
+        inputs= jnp.asarray(inputs, self.dtype)
         inputs = self.rand_proj(
             inputs)  # [batch_size, seq_len, num_codebooks * codebook_dim]
-        inputs_by_group = inputs.reshape(inputs.shape[:2] +
-                                         (self.num_codebooks,
-                                          self.codebook_dim))
 
-        # Normalize inputs if enabled
-        if self.normalize_inputs:
-            inputs_by_group = inputs_by_group / (jnp.linalg.norm(
-                inputs_by_group, axis=-1, keepdims=True) + 1e-12)
+        if self.normalize_latent_vector and not self.normalize_latent_per_group:
+            inputs = _l2_normalize(inputs, -1)
 
-        # Choose similarity metric
-        if self.normalize_codebook:
-            metric = lambda x, y: jnp.einsum("...nd,cd->...nc", x, y
-                                             )  # Dot product similarity
-        else:
-            metric = lambda x, y: -jnp.linalg.norm(x[..., None, :] - y,
-                                                   axis=-1)  # L2 distance
+        # Reshape for group-wise quantization
+        b, l, d = inputs.shape
+        proj_by_group = inputs.reshape(b, l, self.num_groups, d // self.num_groups)
 
-        # Quantize by nearest neighbor
-        similarities = metric(inputs_by_group, self.codebook)
-        ids = jnp.argmax(similarities, axis=-1)
-        onehots = jax.nn.one_hot(ids, self.codebook.shape[0])
-        quantized_vectors = jnp.einsum("...nc,cd->...nd", onehots,
-                                       self.codebook)
+
+        if self.normalize_latent_vector and self.normalize_latent_per_group:
+            proj_by_group = _l2_normalize(proj_by_group, -1)
+
+        # Quantize using vector quantization
+        q, codes, onehot = quantize_vector(proj_by_group, self.codebook)
+        q = q.reshape(b, l, d)
 
         # Apply paddings
-        quantized_vectors = quantized_vectors * (1 - paddings)[..., None, None]
-        onehots = onehots * (1 - paddings)[..., None]
+        q = q * (1 - paddings)[..., None, None]
+        onehots = onehot * (1 - paddings)[..., None]
 
         return {
-            "ids": ids,
-            "onehots": onehots,
-            "quantized_vectors": quantized_vectors,
+            "ids": jax.lax.stop_gradient(codes),
+            "onehots": jax.lax.stop_gradient(onehots),
+            "quantized_vectors": jax.lax.stop_gradient(q),
         }
