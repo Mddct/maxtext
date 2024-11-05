@@ -20,11 +20,11 @@ import common_types
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-from layers.attentions import NdInitializer
-from layers.gpt3 import DenseGeneral
+from common_types import BATCH
 from layers.initializers import nd_dense_init
+from layers.linears import DenseGeneral
 
-Config = common_types.DType
+Config = Any
 
 
 def compute_code_histogram(onehots: jax.Array):
@@ -36,7 +36,6 @@ def compute_code_histogram(onehots: jax.Array):
     Returns:
         Histogram of the quantized codes of shape [num_groups, codebook_size].
     """
-    # [num_codebooks, codebook_size].
     histogram = jnp.sum(onehots, axis=tuple(range(onehots.ndim - 2)))
     return histogram
 
@@ -118,15 +117,22 @@ def _l2_normalize(x: jax.Array,
     return x / jnp.sqrt(jnp.sum(x**2, axis=axis, keepdims=True) + epsilon)
 
 
+BATCH = common_types.BATCH
+LENGTH = common_types.LENGTH
+DIM = common_types.EMBED
+GROUPS = 'code_groups'
+CODEBOOKS = 'code_books'
+
+
 class RandomVectorQuantizer(nn.Module):
-    config: Config
+    config: Any  #: Config
     input_dim: int
     num_groups: int
     num_codebooks: int
     codebook_dim: int
     normalize_inputs: bool = True
     codebook_init_std: float = 1.0
-    kernel_axes: Tuple[str, ...] = ()
+    # kernel_axes: Tuple[str, ...] = ()
     dtype: Any = jnp.float32
     weight_dtype: Any = jnp.float32
 
@@ -134,79 +140,199 @@ class RandomVectorQuantizer(nn.Module):
     normalize_latent_vector: bool = False
     normalize_latent_per_group: bool = True
 
-    # xavier init
-    random_proj_init: NdInitializer = nd_dense_init(
-        1.0, mode='fan_avg', distribution='truncated_normal')
+    axis_names = (BATCH, LENGTH, DIM)
+    kernel_axes = (CODEBOOKS, GROUPS, DIM)
 
-    # noram init
-    random_codebook_init: NdInitializer = nn.initializers.normal(stddev=1.0)
+    @nn.compact
+    def __call__(self, inputs, paddings):
 
-    def setup(self):
         # Initialize the random projection layer
-        self.rand_proj = DenseGeneral(
+        random_proj_init = nd_dense_init(
+            1.0,
+            mode='fan_avg',
+            distribution='truncated_normal',
+        )
+        rand_proj = DenseGeneral(
             axis=-1,
             name='random_projection',
-            features=(self.input_dim, self.num_groups * self.codebook_dim),
+            features=(self.num_groups * self.codebook_dim),
             dtype=self.dtype,
             weight_dtype=self.weight_dtype,
-            kernel_init=self.random_proj_init,
+            kernel_init=random_proj_init,
             kernel_axes=('embed', 'mlp'),
             quant=None,
             use_bias=False,
-            matmul_precision=self.config.matmul_precision,
+            # matmul_precision=self.config.matmul_precision,
+            matmul_precision='default',
         )
         # Initialize and freeze the codebook
-        kernel_axes = ('codebooks', 'code_gorups', 'codebook_dim')
-        self.codebook = self.param(
+        random_codebook_init = nn.initializers.normal(stddev=1.0,
+                                                      dtype=self.weight_dtype)
+        codebook = self.param(
             'codebooks',
-            nn.with_logical_partitioning(self.random_codebook_init,
-                                         kernel_axes),
-            (self.num_codebooks, self.num_groups, self.codebook_dim),
-            self.weight_dtype,
-        )
-
-    def __call__(self, inputs, paddings):
+            nn.with_logical_partitioning(random_codebook_init,
+                                         self.kernel_axes),
+            (self.num_codebooks, self.num_groups, self.codebook_dim))
 
         # Get codebook
-        codebook = self.codebook
         if self.normalize_codebook:
-            codebook = _l2_normalize(self.codebook, axis=-1)
+            codebook = _l2_normalize(codebook, axis=-1)
         # Compute random projection
         inputs = jnp.asarray(inputs, self.dtype)
-        inputs = self.rand_proj(
+        inputs = rand_proj(
             inputs)  # [batch_size, seq_len, num_codebooks * codebook_dim]
-
-        # TODO: logical constraint
-
         if self.normalize_latent_vector and not self.normalize_latent_per_group:
             inputs = _l2_normalize(inputs, -1)
 
-        # Reshape for group-wise quantization
+        inputs = nn.with_logical_constraint(inputs, self.axis_names)
         b, l, d = inputs.shape
-        proj_by_group = inputs.reshape(b * l * d)
+
+        # Reshape for group-wise quantization
+        proj_by_group = inputs.reshape(b * l, d)
         if self.normalize_latent_vector and self.normalize_latent_per_group:
             proj_by_group = _l2_normalize(proj_by_group, -1)
 
         # Quantize using vector quantization
-        q, codes, onehot = quantize_vector(proj_by_group, codebook)
-        # TODO: logical constraint
-
-        q = q.reshape(b, l, d)
+        q, codes, onehots = quantize_vector(proj_by_group, codebook)
+        q = q.reshape(b, l, -1)
         codes = codes.reshape(b, l, self.num_groups)
-        onehot = onehot.reshape(b, l, self.num_groups, self.num_codebooks)
+        onehots = onehots.reshape(b, l, self.num_groups, self.num_codebooks)
+
+        q = nn.with_logical_constraint(q, (BATCH, DIM))
+        codes = nn.with_logical_constraint(codes, (BATCH, GROUPS))
+        onehots = nn.with_logical_constraint(onehots,
+                                             (BATCH, GROUPS, CODEBOOKS))
 
         # Apply paddings
         q = q * (1 - paddings)[..., None]
         codes = codes * (1 - paddings)[..., None]
-        onehots = onehot * (1 - paddings)[..., None, None]
+        onehots = onehots * (1 - paddings)[..., None, None]
 
-        pplx, entropy = compute_code_pplx(onehot, paddings)
-        self.sow('codebook', 'coverage', compute_code_coverage(onehot))
+        pplx, entropy = compute_code_pplx(onehots, paddings)
+        self.sow('codebook', 'coverage', compute_code_coverage(onehots))
         self.sow('codebook', 'pplx', pplx)
         self.sow('codebook', 'entropy', entropy)
 
         return {
-            "ids": jax.lax.stop_gradient(codes),
-            "onehots": jax.lax.stop_gradient(onehots),
-            "quantized_vectors": jax.lax.stop_gradient(q),
+            "ids":
+            jax.lax.stop_gradient(codes),
+            "onehots":
+            jax.lax.stop_gradient(onehots),
+            "quantized_vectors":
+            jax.lax.stop_gradient(
+                q.reshape(b, l, self.num_groups, self.codebook_dim)),
         }
+
+
+class SeqVectorQuantizer(nn.Module):
+    """Vector quantizer using MSE loss."""
+    num_codebooks: int
+    codebook_dim: int
+    beta: float
+    num_groups: int = 1
+    normalize_codebook: bool = False
+    normalize_inputs: bool = False
+    dtype: jnp.dtype = jnp.float32
+    weight_dtype: jnp.dtype = jnp.float32
+
+    kernel_axes = (CODEBOOKS, GROUPS, DIM)
+
+    @nn.compact
+    def __call__(self, inputs: jax.Array, paddings: jax.Array) -> Any:
+        """Forward function for quantization and loss calculation.
+
+        Args:
+            inputs: Input tensor of shape [batch_size, seq_len, input_dim]
+            paddings: 0/1 tensor of shape [batch_size, seq_len]
+
+        Returns:
+            Dictionary with quantized vectors and losses
+        """
+        # Define input dimensions
+        input_dim = self.num_groups * self.codebook_dim
+        batch_size, seq_len = inputs.shape[:2]
+
+        # Verify input dimension compatibility
+        if inputs.shape[-1] != input_dim:
+            raise ValueError(
+                f"Input feature dimension must match dimensions of all codebooks."
+                f"{inputs.shape[-1]} != {self.num_groups} x {self.codebook_dim}."
+            )
+
+        inputs = jnp.asarray(inputs, dtype=self.dtype)
+        # Initialize codebook parameters
+        # Sect 3.1 https://arxiv.org/pdf/2202.01855.pdf.
+        # Codebook uses standard Gaussian initialization.
+        codebook_init = nn.initializers.normal(stddev=1.0,
+                                               dtype=self.weight_dtype)
+        codebook = self.param(
+            'codebooks',
+            nn.with_logical_partitioning(codebook_init, self.kernel_axes),
+            (self.num_codebooks, self.num_groups, self.codebook_dim))
+
+        # Reshape inputs by grouping according to codebooks
+        inputs_by_group = jnp.reshape(
+            inputs, [batch_size, seq_len, self.num_groups, self.codebook_dim])
+
+        if self.normalize_codebook:
+            codebook = _l2_normalize(codebook, -1)
+        if self.normalize_inputs:
+            inputs_by_group = _l2_normalize(inputs_by_group, axis=-1)
+
+        q, codes, onehots = quantize_vector(
+            inputs_by_group.reshape(-1, self.codebook_dim), codebook)
+        q = q.reshape(batch_size, seq_len, -1)
+        codes = codes.reshape(batch_size, seq_len, self.num_groups)
+        onehots = onehots.reshape(batch_size, seq_len, self.num_groups,
+                                  self.num_codebooks)
+        q = nn.with_logical_constraint(q, (BATCH, DIM))
+        codes = nn.with_logical_constraint(codes, (BATCH, GROUPS))
+        onehots = nn.with_logical_constraint(onehots,
+                                             (BATCH, GROUPS, CODEBOOKS))
+
+        # Apply paddings
+        q = q * (1 - paddings)[..., None]
+        codes = codes * (1 - paddings)[..., None]
+        onehots = onehots * (1 - paddings)[..., None, None]
+        pplx, entropy = compute_code_pplx(onehots, paddings)
+
+        self.sow('codebook', 'coverage', compute_code_coverage(onehots))
+        self.sow('codebook', 'pplx', pplx)
+        self.sow('codebook', 'entropy', entropy)
+
+        # Calculate mean squared error loss
+        num_frames = jnp.sum(1 - paddings)
+        denominator = jnp.maximum(num_frames * input_dim, 1)
+
+        inputs_to_loss = (jnp.reshape(inputs_by_group,
+                                      [batch_size, seq_len, -1])
+                          if self.normalize_inputs else inputs)
+
+        kmeans_loss = (jnp.sum((q - jax.lax.stop_gradient(inputs_to_loss))**2 *
+                               (1 - paddings)[:, :, None]) / denominator)
+
+        commitment_loss = (jnp.sum(
+            (inputs_to_loss - jax.lax.stop_gradient(q))**2 *
+            (1 - paddings)[:, :, None]) / denominator)
+
+        self.sow('loss', 'kmeans_loss', kmeans_loss)
+        self.sow('loss', 'commitment_loss', commitment_loss)
+        total_loss = kmeans_loss + self.beta * commitment_loss
+
+        # Straight-through estimator for quantized vectors
+        quantized_vectors = inputs + jax.lax.stop_gradient(q - inputs)
+        quantized_vectors = quantized_vectors * (1 - paddings)[:, :, None]
+
+        outputs = {
+            "ids":
+            codes,
+            "onehots":
+            onehots,
+            "quantized_vectors":
+            quantized_vectors.reshape(batch_size, seq_len, self.num_groups,
+                                      self.codebook_dim),
+            "loss":
+            total_loss,
+        }
+
+        return outputs

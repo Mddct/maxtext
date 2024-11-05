@@ -1,11 +1,11 @@
 ## TODO:
+- [x] wenet dataset
 - [x] random quantize
-- [ ] seq quantize
-- [ ] kmeans quantize
-- [ ] vector quantize
+- [x] seq quantize
+    - [ ] simq
 - [ ] gumbel quantize
 - [ ] conformer
-- [ ] ctc && rnnt loss
-- [ ] ctc && rnnt search
+   - [ ] ctc && rnnt loss
+   - [ ] ctc && rnnt search
 - [ ] long context bestrq-pretrain
 - [ ] long context speechLLM understanding
