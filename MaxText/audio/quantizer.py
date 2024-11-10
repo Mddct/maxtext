@@ -132,11 +132,10 @@ class RandomVectorQuantizer(nn.Module):
     codebook_dim: int
     normalize_inputs: bool = True
     codebook_init_std: float = 1.0
-    # kernel_axes: Tuple[str, ...] = ()
     dtype: Any = jnp.float32
     weight_dtype: Any = jnp.float32
 
-    normalize_codebook: bool = False
+    normalize_codebook: bool = True
     normalize_latent_vector: bool = False
     normalize_latent_per_group: bool = True
 
@@ -336,3 +335,119 @@ class SeqVectorQuantizer(nn.Module):
         }
 
         return outputs
+
+
+class GumbelSoftmaxVectorQuantizer(nn.Module):
+    """Vector quantizer using the Gumbel softmax trick.
+    https://arxiv.org/pdf/1611.01144.pdf
+    """
+    input_dim: int
+    num_codebooks: int
+    codebook_dim: int
+    num_groups: int
+    temperature_schedule: Any  # should be a callable schedule function for temperature
+    weight_dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        # Initialize input projection module
+        self.input_proj = nn.Dense(
+            features=(self.num_codebooks * self.num_groups),  # flattened shape
+            dtype=self.weight_dtype,
+        )
+        # Initialize codebook as a parameter
+        self.codebook = self.param(
+            "codebook", nn.initializers.uniform(scale=1.0),
+            (self.num_codebooks, self.num_groups, self.codebook_dim),
+            self.weight_dtype)
+        # Initialize step as a parameter for temperature schedule
+        self.step = self.variable("state", "step",
+                                  lambda: jnp.array(0.0, dtype=jnp.float32))
+
+    def __call__(self, inputs: jax.Array, paddings: jax.Array,
+                 training: bool) -> Any:
+        """Forward pass for quantization using Gumbel softmax trick.
+
+        Args:
+            inputs: Input tensor of shape [batch_size, seq_len, input_dim].
+            paddings: 0/1 tensor of shape [batch_size, seq_len].
+            is_training: Boolean indicating if the model is in training mode.
+
+        Returns:
+            Dictionary containing quantized vectors and other outputs.
+        """
+        # Project inputs to logits for Gumbel-Softmax quantization
+        logits = self.input_proj(
+            inputs)  # [batch_size, seq_len, num_codebooks * num_groups]
+        logits = logits.reshape(inputs.shape[0], inputs.shape[1],
+                                self.num_groups, self.num_codebooks)
+
+        if training:
+            # Apply temperature scheduling for Gumbel-Softmax
+            tau = self.temperature_schedule(self.step.value)
+            # Add Gumbel noise for sampling in training
+            gumbel_noise = jax.random.gumbel(self.make_rng("gumbel"),
+                                             logits.shape)
+            logits = (logits + gumbel_noise) / tau
+            # Increment step variable
+            self.step.value += 1
+
+        # Select the max index in logits as quantization ID
+        ids = jnp.argmax(logits, axis=-1)  # [batch_size, seq_len, num_groups]
+
+        if not training:
+            # Direct lookup for inference
+            quantized_vectors = self._lookup(ids, self.codebook)
+            ids = ids * (1 - paddings[:, :, None])
+            quantize_vector = quantize_vectors * (1 - paddings)[:, :, None,
+                                                                None]
+        else:
+            # Mask padding positions
+            mask = (1 - paddings)[:, :, None]
+            ids = ids * mask + (-1) * (1 - mask)
+
+            # Convert IDs to one-hot encoding for Gumbel-Softmax
+            onehots = jax.nn.one_hot(
+                ids, num_classes=self.num_codebooks) * mask[:, :, :, None]
+            y_soft = jax.nn.softmax(logits, axis=-1) * mask[:, :, :, None]
+
+            # Straight-through estimator: dL/dy_soft = dL/donehots
+            onehots = y_soft + jax.lax.stop_gradient(onehots - y_soft)
+
+            # Matrix multiply one-hot with codebook to get quantized vectors
+            quantized_vectors = jnp.einsum("...gv,vgh->...gh", onehots,
+                                           self.codebook)
+            quantized_vectors = quantized_vectors * mask[:, :, :, None]
+
+        outputs = {
+            "ids": ids,
+            "quantized_vectors": quantized_vectors,
+        }
+
+        if training:
+            self.sow('gumbel', 'temperature', tau)
+            self.sow('gumbel', 'temperature_step', self.step.value)
+            self.sow('gumbel', 'probs', y_soft)
+
+        return outputs
+
+    def _lookup(self, ids: jax.Array, codebook: jax.Array) -> jax.Array:
+        """Lookup function to retrieve vectors from codebook based on ids.
+
+        Args:
+            ids: Integer tensor of shape [..., num_groups] with values
+                in range [0, num_codebooks).
+            codebook: Tensor of shape [num_codebooks, num_groups, codebook_dim].
+
+        Returns:
+            quantized vectors.
+        """
+        if ids.ndim - 1 > 11:  # Ensures we are within einsum dimension limits
+            raise NotImplementedError(ids.shape)
+
+        # Create an index for the num_codebooks axis
+        g_index = jnp.expand_dims(jnp.arange(ids.shape[-1]),
+                                  axis=tuple(range(ids.ndim - 1)))
+
+        # Retrieve quantized vectors by indexing into the codebook
+        quantized_vectors = codebook[ids, g_index]
+        return quantized_vectors
