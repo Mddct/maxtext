@@ -3,7 +3,9 @@
 - [x] random quantize
 - [x] seq quantize
     - [ ] simq
-- [ ] gumbel quantize
+- [ ] vq ema
+- [x] gumbel quantize
+- [x] specaugment in batch
 - [ ] conformer
    - [ ] ctc && rnnt loss
    - [ ] ctc && rnnt search
