@@ -301,7 +301,7 @@ class SeqVectorQuantizer(nn.Module):
 
         # Calculate mean squared error loss
         num_frames = jnp.sum(1 - paddings)
-        denominator = jnp.maximum(num_frames * input_dim, 1)
+        denominator = jnp.maximum(num_frames * input_dim, 1e-6)
 
         inputs_to_loss = (jnp.reshape(inputs_by_group,
                                       [batch_size, seq_len, -1])
@@ -341,28 +341,17 @@ class GumbelSoftmaxVectorQuantizer(nn.Module):
     """Vector quantizer using the Gumbel softmax trick.
     https://arxiv.org/pdf/1611.01144.pdf
     """
-    input_dim: int
+    # input_dim: int
     num_codebooks: int
     codebook_dim: int
     num_groups: int
     temperature_schedule: Any  # should be a callable schedule function for temperature
     weight_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.float32
 
-    def setup(self):
-        # Initialize input projection module
-        self.input_proj = nn.Dense(
-            features=(self.num_codebooks * self.num_groups),  # flattened shape
-            dtype=self.weight_dtype,
-        )
-        # Initialize codebook as a parameter
-        self.codebook = self.param(
-            "codebook", nn.initializers.uniform(scale=1.0),
-            (self.num_codebooks, self.num_groups, self.codebook_dim),
-            self.weight_dtype)
-        # Initialize step as a parameter for temperature schedule
-        self.step = self.variable("state", "step",
-                                  lambda: jnp.array(0.0, dtype=jnp.float32))
+    kernel_axes = (CODEBOOKS, GROUPS, DIM)
 
+    @nn.compact
     def __call__(self, inputs: jax.Array, paddings: jax.Array,
                  training: bool) -> Any:
         """Forward pass for quantization using Gumbel softmax trick.
@@ -376,7 +365,38 @@ class GumbelSoftmaxVectorQuantizer(nn.Module):
             Dictionary containing quantized vectors and other outputs.
         """
         # Project inputs to logits for Gumbel-Softmax quantization
-        logits = self.input_proj(
+        input_proj = nn.Dense(
+            features=(self.num_codebooks * self.num_groups),  # flattened shape
+            dtype=self.weight_dtype,
+        )
+
+        proj_init = nd_dense_init(
+            1.0,
+            mode='fan_avg',
+            distribution='truncated_normal',
+        )
+        input_proj = DenseGeneral(
+            axis=-1,
+            name='projection',
+            features=(self.num_groups * self.num_codebooks),
+            dtype=self.dtype,
+            weight_dtype=self.weight_dtype,
+            kernel_init=proj_init,
+            kernel_axes=('embed', 'mlp'),
+            quant=None,
+            use_bias=False,
+            # matmul_precision=self.config.matmul_precision,
+            matmul_precision='default',
+        )
+
+        codebook_init = nn.initializers.uniform(scale=1.0,
+                                                dtype=self.weight_dtype)
+        codebook = self.param(
+            'codebooks',
+            nn.with_logical_partitioning(codebook_init, self.kernel_axes),
+            (self.num_codebooks, self.num_groups, self.codebook_dim))
+
+        logits = input_proj(
             inputs)  # [batch_size, seq_len, num_codebooks * num_groups]
         logits = logits.reshape(inputs.shape[0], inputs.shape[1],
                                 self.num_groups, self.num_codebooks)
@@ -389,17 +409,17 @@ class GumbelSoftmaxVectorQuantizer(nn.Module):
                                              logits.shape)
             logits = (logits + gumbel_noise) / tau
             # Increment step variable
-            self.step.value += 1
+            # self.step = jax.numpy.add(self.step + 1)
 
         # Select the max index in logits as quantization ID
         ids = jnp.argmax(logits, axis=-1)  # [batch_size, seq_len, num_groups]
 
         if not training:
             # Direct lookup for inference
-            quantized_vectors = self._lookup(ids, self.codebook)
+            quantized_vectors = self._lookup(ids, codebook)
             ids = ids * (1 - paddings[:, :, None])
-            quantize_vector = quantize_vectors * (1 - paddings)[:, :, None,
-                                                                None]
+            quantized_vectors = quantized_vectors * (1 - paddings)[:, :, None,
+                                                                   None]
         else:
             # Mask padding positions
             mask = (1 - paddings)[:, :, None]
@@ -414,8 +434,11 @@ class GumbelSoftmaxVectorQuantizer(nn.Module):
             onehots = y_soft + jax.lax.stop_gradient(onehots - y_soft)
 
             # Matrix multiply one-hot with codebook to get quantized vectors
-            quantized_vectors = jnp.einsum("...gv,vgh->...gh", onehots,
-                                           self.codebook)
+            quantized_vectors = jnp.einsum(
+                "...gv,vgh->...gh",
+                onehots,
+                codebook,
+            )
             quantized_vectors = quantized_vectors * mask[:, :, :, None]
 
         outputs = {
@@ -425,7 +448,6 @@ class GumbelSoftmaxVectorQuantizer(nn.Module):
 
         if training:
             self.sow('gumbel', 'temperature', tau)
-            self.sow('gumbel', 'temperature_step', self.step.value)
             self.sow('gumbel', 'probs', y_soft)
 
         return outputs
