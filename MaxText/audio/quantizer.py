@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 import common_types
 import flax.linen as nn
@@ -337,6 +337,17 @@ class SeqVectorQuantizer(nn.Module):
         return outputs
 
 
+def gumbel_scheduler(step: jax.Array,
+                     max_gumbel_temperature: float = 2.0,
+                     gumbel_temperature_decay: float = 0.999995,
+                     min_gumbel_temperature: float = 0.1):
+    gumbel_temperature = jnp.clip(
+        max_gumbel_temperature * gumbel_temperature_decay**step,
+        a_min=min_gumbel_temperature,
+    )
+    return gumbel_temperature
+
+
 class GumbelSoftmaxVectorQuantizer(nn.Module):
     """Vector quantizer using the Gumbel softmax trick.
     https://arxiv.org/pdf/1611.01144.pdf
@@ -345,15 +356,17 @@ class GumbelSoftmaxVectorQuantizer(nn.Module):
     num_codebooks: int
     codebook_dim: int
     num_groups: int
-    temperature_schedule: Any  # should be a callable schedule function for temperature
     weight_dtype: jnp.dtype = jnp.float32
     dtype: jnp.dtype = jnp.float32
 
     kernel_axes = (CODEBOOKS, GROUPS, DIM)
 
     @nn.compact
-    def __call__(self, inputs: jax.Array, paddings: jax.Array,
-                 training: bool) -> Any:
+    def __call__(self,
+                 inputs: jax.Array,
+                 paddings: jax.Array,
+                 training: bool,
+                 gumbel_temperature: Optional[jax.Array] = None) -> Any:
         """Forward pass for quantization using Gumbel softmax trick.
 
         Args:
@@ -403,13 +416,15 @@ class GumbelSoftmaxVectorQuantizer(nn.Module):
 
         if training:
             # Apply temperature scheduling for Gumbel-Softmax
-            tau = self.temperature_schedule(self.step.value)
+            if gumbel_temperature is not None:
+                assert isinstance(gumbel_temperature, jax.Array)
+                tau = gumbel_temperature
+            else:
+                tau = 1.0
             # Add Gumbel noise for sampling in training
             gumbel_noise = jax.random.gumbel(self.make_rng("gumbel"),
                                              logits.shape)
             logits = (logits + gumbel_noise) / tau
-            # Increment step variable
-            # self.step = jax.numpy.add(self.step + 1)
 
         # Select the max index in logits as quantization ID
         ids = jnp.argmax(logits, axis=-1)  # [batch_size, seq_len, num_groups]
