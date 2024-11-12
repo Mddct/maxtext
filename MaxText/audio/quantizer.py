@@ -17,6 +17,7 @@ limitations under the License.
 from typing import Any, Optional, Tuple
 
 import common_types
+import flax
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -25,19 +26,6 @@ from layers.initializers import nd_dense_init
 from layers.linears import DenseGeneral
 
 Config = Any
-
-
-def uniform_sqrt_init_fn(scale: float = 1.0, dtype: jnp.dtype = jnp.float_):
-
-    def init(key, shape, dtype=dtype):
-        dtype = jax.dtypes.canonicalize_dtype(dtype)
-        return jax.random.uniform(key,
-                                  shape=shape,
-                                  dtype=dtype,
-                                  minval=-scale,
-                                  maxval=scale)
-
-    return init
 
 
 def compute_code_histogram(onehots: jax.Array):
@@ -251,11 +239,9 @@ class SeqVectorQuantizer(nn.Module):
 
     kernel_axes = (CODEBOOKS, GROUPS, DIM)
 
-    def loss(self, input, quantized):
-        pass
-
     @nn.compact
-    def __call__(self, inputs: jax.Array, paddings: jax.Array) -> Any:
+    def __call__(self, inputs: jax.Array, paddings: jax.Array,
+                 training: bool) -> Any:
         """Forward function for quantization and loss calculation.
 
         Args:
@@ -335,8 +321,8 @@ class SeqVectorQuantizer(nn.Module):
             (inputs_to_loss - jax.lax.stop_gradient(q))**2 *
             (1 - paddings)[:, :, None]) / denominator)
 
-        self.sow('loss', 'kmeans_loss', kmeans_loss)
-        self.sow('loss', 'commitment_loss', commitment_loss)
+        # self.sow('loss', 'kmeans_loss', kmeans_loss)
+        # self.sow('loss', 'commitment_loss', commitment_loss)
         total_loss = kmeans_loss + self.beta * commitment_loss
 
         # Straight-through estimator for quantized vectors
