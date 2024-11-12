@@ -8,6 +8,7 @@
 - [x] gumbel quantize
 - [x] specaugment in batch
 - [ ] conformer
+   - [x] conv2d with 1d padding
    - [ ] ctc && rnnt loss
    - [ ] ctc && rnnt search
 - [ ] long context bestrq-pretrain
