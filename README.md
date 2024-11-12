@@ -3,7 +3,8 @@
 - [x] random quantize
 - [x] seq quantize
     - [ ] simq
-- [ ] vq ema
+    - [ ] vq ema
+    - [ ] refresh codebooks when low thresold
 - [x] gumbel quantize
 - [x] specaugment in batch
 - [ ] conformer
