@@ -27,6 +27,19 @@ from layers.linears import DenseGeneral
 Config = Any
 
 
+def uniform_sqrt_init_fn(scale: float = 1.0, dtype: jnp.dtype = jnp.float_):
+
+    def init(key, shape, dtype=dtype):
+        dtype = jax.dtypes.canonicalize_dtype(dtype)
+        return jax.random.uniform(key,
+                                  shape=shape,
+                                  dtype=dtype,
+                                  minval=-scale,
+                                  maxval=scale)
+
+    return init
+
+
 def compute_code_histogram(onehots: jax.Array):
     """Computes histograms of the quantized codes over the codebook vocabulary.
 
@@ -145,11 +158,11 @@ class RandomVectorQuantizer(nn.Module):
     @nn.compact
     def __call__(self, inputs, paddings):
 
-        # Initialize the random projection layer
+        # Initialize the random projection layer: xavier_uniform
         random_proj_init = nd_dense_init(
             1.0,
             mode='fan_avg',
-            distribution='truncated_normal',
+            distribution='uniform',
         )
         rand_proj = DenseGeneral(
             axis=-1,
@@ -165,6 +178,8 @@ class RandomVectorQuantizer(nn.Module):
             matmul_precision='default',
         )
         # Initialize and freeze the codebook
+        # Sect 3.1 https://arxiv.org/pdf/2202.01855.pdf.
+        # Codebook uses standard Gaussian initialization.
         random_codebook_init = nn.initializers.normal(stddev=1.0,
                                                       dtype=self.weight_dtype)
         codebook = self.param(
@@ -236,6 +251,9 @@ class SeqVectorQuantizer(nn.Module):
 
     kernel_axes = (CODEBOOKS, GROUPS, DIM)
 
+    def loss(self, input, quantized):
+        pass
+
     @nn.compact
     def __call__(self, inputs: jax.Array, paddings: jax.Array) -> Any:
         """Forward function for quantization and loss calculation.
@@ -259,15 +277,18 @@ class SeqVectorQuantizer(nn.Module):
             )
 
         inputs = jnp.asarray(inputs, dtype=self.dtype)
-        # Initialize codebook parameters
-        # Sect 3.1 https://arxiv.org/pdf/2202.01855.pdf.
-        # Codebook uses standard Gaussian initialization.
-        codebook_init = nn.initializers.normal(stddev=1.0,
-                                               dtype=self.weight_dtype)
+        # uniform init
+        codebook_init = nd_dense_init(1.0,
+                                      mode='fan_in',
+                                      distribution='uniform')
         codebook = self.param(
             'codebooks',
             nn.with_logical_partitioning(codebook_init, self.kernel_axes),
-            (self.num_codebooks, self.num_groups, self.codebook_dim))
+            (self.num_codebooks, self.num_groups, self.codebook_dim),
+            in_axis=(0, 1),
+            out_axis=(2),
+            dtype=self.dtype,
+        )
 
         # Reshape inputs by grouping according to codebooks
         inputs_by_group = jnp.reshape(
@@ -378,11 +399,6 @@ class GumbelSoftmaxVectorQuantizer(nn.Module):
             Dictionary containing quantized vectors and other outputs.
         """
         # Project inputs to logits for Gumbel-Softmax quantization
-        input_proj = nn.Dense(
-            features=(self.num_codebooks * self.num_groups),  # flattened shape
-            dtype=self.weight_dtype,
-        )
-
         proj_init = nd_dense_init(
             1.0,
             mode='fan_avg',
