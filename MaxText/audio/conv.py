@@ -192,6 +192,74 @@ class Conv2DWith1DPadding(nn.Module):
     strides: Tuple[int, int] = (2, 2)  # Stride for convolution along each axis
     padding: Tuple[Tuple[int, int], Tuple[int, int]] = (
         (1, 1), (1, 1))  # Padding for time and frequency
+
+    """ https://github.com/apple/axlearn/blob/main/axlearn/common/layers.py#L1186
+    For examples with window=5,
+        1. "SAME" padding case,
+            * padding=(2,2): (0 0 0 0 0)
+            * anchor index is 2: (0 0 |0| 0 0)
+                        pad  |           | pad
+            paddings:     0 0|0 0 0 1 1 1|1 1
+                          |___0___|
+                            |___0___|
+                              |___0___|
+                                |___1___|
+                                  |___1___|
+                                    |___1___|
+
+        2. "VALID" padding case,
+            * padding=(0,0): (0 0 0 0 0)
+            * anchor index is 0:  (|0| 0 0 0 0)
+                    pad |           | pad
+            paddings:   |0 0 0 1 1 1|
+                        |0_______|
+                          |0_______|
+
+        3. The legacy "VALID" padding case,
+            * padding=(0,0) and anchor=4: (0 0 0 0 0)
+            * anchor index is 4:  (0 0 0 0 |0|)
+                    pad |           | pad
+            paddings:   |0 0 0 1 1 1|
+                        |________1|
+                          |________1|
+
+        4. "CAUSAL" padding case,
+            * padding=(4,0): (0 0 0 0 0)
+            * anchor index is 4:  (0 0 0 0 |0|)
+                        pad      |           | pad
+            paddings:     0 0 0 0|0 0 0 1 1 1|
+                          |_______0|
+                            |_______0|
+                              |_______0|
+                                |_______1|
+                                  |_______1|
+                                    |_______1|
+
+        5. "CAUSAL" with lookahead=1,
+            * padding=(3, 1): (0 0 0 0 0)
+            * anchor index is 3:  (0 0 0 |0| 0)
+                        pad    |           | pad
+            paddings:     0 0 0|0 0 0 1 1 1|1
+                          |_____0_|
+                            |_____0_|
+                              |_____0_|
+                                |_____1_|
+                                  |_____1_|
+                                    |_____1_|
+
+        6. Arbitrary padding case,
+            * padding=(2,1): (0 0 0 0 0)
+            * anchor index is 2:  (0 0 |0| 0 0)
+                        pad  |           | pad
+            paddings:     0 0|0 0 0 1 1 1|1
+                          |___0___|
+                            |___0___|
+                              |___0___|
+                                |___1___|
+                                  |___1___|
+        """
+
+    """
     anchor: Optional[
         int] = None  # Anchor point for determining output validity
 
